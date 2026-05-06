@@ -1,0 +1,106 @@
+@layer tailwind-base, primevue, tailwind-utilities;
+
+@import 'tailwindcss/preflight.css' layer(tailwind-base);
+@import 'tailwindcss/theme.css' layer(tailwind-base);
+@import 'tailwindcss/utilities.css' layer(tailwind-utilities);
+
+@plugin "tailwindcss-primeui";
+
+/* ── Align Tailwind dark: variant with PrimeVue's .dark class ── */
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* ── Apple system font ──────────────────────────────── */
+html, body, * {
+  font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'SF Pro Text',
+    system-ui, -webkit-system-font, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* ── Mobile / Capacitor safe-area ─────────────────────── */
+html {
+  --sat: env(safe-area-inset-top, 0px);
+  --sab: env(safe-area-inset-bottom, 0px);
+  --sal: env(safe-area-inset-left, 0px);
+  --sar: env(safe-area-inset-right, 0px);
+}
+
+body {
+  padding-top: var(--sat);
+  padding-bottom: var(--sab);
+  padding-left: var(--sal);
+  padding-right: var(--sar);
+  -webkit-tap-highlight-color: transparent;
+  -webkit-touch-callout: none;
+  overscroll-behavior: none;
+}
+
+html { -webkit-text-size-adjust: 100%; }
+
+/* ── Thin scrollbar ───────────────────────────────────── */
+::-webkit-scrollbar { width: 5px; height: 5px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.12); border-radius: 100px; }
+.dark ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.10); }
+::-webkit-scrollbar-thumb:hover { background: rgba(0,0,0,0.22); }
+.dark ::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.18); }
+
+/* ── Elevated card (solid surface) ────────────────────── */
+.card {
+  background: #ffffff;
+  border: 1px solid rgba(0, 0, 0, 0.06);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04), 0 1px 2px rgba(0, 0, 0, 0.02);
+}
+.dark .card {
+  background: #1c1c1e;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.3);
+}
+
+/* ── Inset section (nested inside cards) ──────────────── */
+.card-inset {
+  background: #f5f5f7;
+  border: 1px solid rgba(0, 0, 0, 0.04);
+}
+.dark .card-inset {
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+/* ── Frosted glass (nav bar & floating overlays only) ─── */
+.glass {
+  backdrop-filter: blur(24px) saturate(180%);
+  -webkit-backdrop-filter: blur(24px) saturate(180%);
+  background: rgba(255, 255, 255, 0.72);
+  border: 1px solid rgba(255, 255, 255, 0.85);
+  box-shadow: 0 2px 24px rgba(0,0,0,0.06), 0 1px 2px rgba(0,0,0,0.04);
+}
+.dark .glass {
+  background: rgba(255, 255, 255, 0.055);
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  box-shadow: 0 2px 32px rgba(0,0,0,0.35), 0 1px 3px rgba(0,0,0,0.2);
+}
+
+/* ── Smooth transitions ───────────────────────────────── */
+.p-button, .p-tag, .p-select, .p-inputtext, .p-datatable-row {
+  transition: all 150ms cubic-bezier(0.4, 0, 0.2, 1) !important;
+}
+
+/* ── DataTable row hover ──────────────────────────────── */
+.p-datatable .p-datatable-tbody > tr {
+  transition: background 120ms ease !important;
+}
+.p-datatable .p-datatable-tbody > tr:hover {
+  background: rgba(0, 0, 0, 0.03) !important;
+}
+.dark .p-datatable .p-datatable-tbody > tr:hover {
+  background: rgba(255, 255, 255, 0.04) !important;
+}
+
+/* ── Card-wrapped DataTable: transparent internals ────── */
+.card .p-datatable-header,
+.card .p-datatable-thead > tr > th,
+.card .p-datatable-tfoot > tr > td,
+.card .p-paginator {
+  background: transparent !important;
+}
