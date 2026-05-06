@@ -3,6 +3,8 @@ import { onMounted, onUnmounted, computed, ref } from 'vue'
 import { store } from './store'
 import { api } from './platform'
 import { useToast } from 'primevue/usetoast'
+import { useConfirm } from 'primevue/useconfirm'
+import { checkForUpdate, downloadAndInstall, skipVersion } from './utils/androidUpdater'
 import Tabs from 'primevue/tabs'
 import TabList from 'primevue/tablist'
 import Tab from 'primevue/tab'
@@ -20,9 +22,60 @@ import Configuration from './components/Configuration.vue'
 import Login from './components/Login.vue'
 
 const toast = useToast()
+const confirm = useConfirm()
 
 const darkMode = ref(localStorage.getItem('darkMode') !== 'false')
 const ghostLoading = ref(false)
+
+async function runAndroidUpdateFlow() {
+    let result
+    try {
+        result = await checkForUpdate()
+    } catch (e) {
+        console.warn('Update check failed', e)
+        return
+    }
+    if (!result || !result.available) return
+
+    confirm.require({
+        header: 'Actualización disponible',
+        message: `Versión ${result.version} disponible (tienes la ${result.installed}). ¿Descargar e instalar ahora?`,
+        acceptLabel: 'Actualizar',
+        rejectLabel: 'Más tarde',
+        accept: async () => {
+            const sticky = toast.add({
+                severity: 'info',
+                summary: 'Descargando actualización',
+                detail: '0%',
+                life: 0,
+                closable: false,
+            })
+            try {
+                await downloadAndInstall(result.asset, (pct) => {
+                    if (sticky) sticky.detail = `${Math.round(pct * 100)}%`
+                })
+                toast.removeAllGroups?.()
+                toast.add({
+                    severity: 'success',
+                    summary: 'Listo',
+                    detail: 'Confirma la instalación en el diálogo del sistema.',
+                    life: 6000,
+                })
+            } catch (e) {
+                toast.removeAllGroups?.()
+                toast.add({
+                    severity: 'error',
+                    summary: 'Error al actualizar',
+                    detail: e.message || 'No se pudo descargar el APK.',
+                    life: 8000,
+                })
+            }
+        },
+        reject: () => {
+            skipVersion(result.version)
+        },
+    })
+}
 
 async function handleGhostToggle() {
     if (!store.isLoaded) return
@@ -87,6 +140,8 @@ onMounted(async () => {
         await store.logout()
         toast.add({ severity: 'error', summary: 'Error de carga', detail: e.message, life: 8000 })
     }
+    // Android sideload auto-update — no-op on Electron/web.
+    runAndroidUpdateFlow()
 })
 
 function openFileFromToast(filePath) {
