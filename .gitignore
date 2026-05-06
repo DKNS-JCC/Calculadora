@@ -10,10 +10,21 @@ node_modules/
 .env.*
 !.env.example
 
-# Capacitor / mobile
-/android
-/ios
-capacitor.config.json
+# Signing keys (never commit anywhere in the tree)
+*.jks
+*.keystore
+keystore.properties
+
+# Android: track sources, exclude generated build artefacts and machine-specific config
+/android/.gradle/
+/android/build/
+/android/app/build/
+/android/app/release/
+/android/app/debug/
+/android/local.properties
+/android/captures/
+/android/.idea/
+/ios/
 
 # Logs / cache / scratch
 *.log
