@@ -1,0 +1,97 @@
+{
+  "name": "3dcalc",
+  "version": "5.0.0",
+  "description": "Calculadora 3D para presupuestos de impresión 3D",
+  "main": "electron-main/main.js",
+  "author": {
+    "name": "dkns-developments"
+  },
+  "scripts": {
+    "dev": "concurrently \"vite --host 127.0.0.1 --port 5173 --strictPort\" \"wait-on http://127.0.0.1:5173/@vite/client && electron .\"",
+    "dev:web": "vite --host 0.0.0.0 --port 5173",
+    "build": "vite build && electron-builder --win",
+    "build:win": "vite build",
+    "publish": "vite build && electron-builder --win --publish always",
+    "build:mobile": "vite build && npx cap sync",
+    "cap:sync": "npx cap sync",
+    "cap:open:android": "npx cap open android",
+    "cap:run:android": "vite build && npx cap sync android && npx cap run android",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@capacitor/android": "^8.1.0",
+    "@capacitor/app": "^8.0.1",
+    "@capacitor/browser": "^8.0.1",
+    "@capacitor/cli": "^8.1.0",
+    "@capacitor/clipboard": "^8.0.1",
+    "@capacitor/core": "^8.1.0",
+    "@capacitor/haptics": "^8.0.0",
+    "@capacitor/keyboard": "^8.0.0",
+    "@capacitor/share": "^8.0.1",
+    "@capacitor/status-bar": "^8.0.1",
+    "electron-updater": "^6.8.3",
+    "firebase": "^12.9.0",
+    "nodemailer": "^6.10.1",
+    "pdfkit": "^0.17.2",
+    "stripe": "^18.5.0"
+  },
+  "devDependencies": {
+    "@primevue/themes": "^4.5.4",
+    "@tailwindcss/vite": "^4.1.18",
+    "@vitejs/plugin-vue": "^6.0.4",
+    "chart.js": "^4.5.1",
+    "concurrently": "^9.2.1",
+    "electron": "^37.2.3",
+    "electron-builder": "^26.0.12",
+    "primeicons": "^7.0.0",
+    "primevue": "^4.5.4",
+    "tailwindcss": "^4.1.18",
+    "tailwindcss-primeui": "^0.6.1",
+    "vite": "^7.3.1",
+    "vue": "^3.5.28",
+    "wait-on": "^9.0.4",
+    "zod": "^4.3.6"
+  },
+  "build": {
+    "appId": "com.3dc.calculadora",
+    "productName": "3DCALC",
+    "directories": {
+      "output": "dist-electron"
+    },
+    "files": [
+      "dist/**/*",
+      "electron-main/**/*",
+      "logos/**/*",
+      "icon.ico",
+      "package.json"
+    ],
+    "asarUnpack": [
+      "node_modules/pdfkit/**/*",
+      "node_modules/fontkit/**/*",
+      "node_modules/linebreak/**/*",
+      "node_modules/nodemailer/**/*",
+      "logos/**/*"
+    ],
+    "win": {
+      "icon": "icon.ico",
+      "target": [
+        "nsis"
+      ]
+    },
+    "nsis": {
+      "installerIcon": "icon.ico",
+      "uninstallerIcon": "icon.ico",
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "differentialPackage": true
+    },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "DKNS-JCC",
+        "repo": "Calculadora"
+      }
+    ]
+  }
+}

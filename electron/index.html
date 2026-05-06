@@ -1,0 +1,454 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Calculadora 3D</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <header class="header">
+      <div class="title-wrap">
+        <h1 id="appTitle">3DCALC</h1>
+        <span>Calculadora de Costes de Impresión 3D</span>
+      </div>
+    </header>
+
+    <nav class="tabs" id="tabsNav">
+      <button data-tab="calc" class="tab active">💰 Calculadora</button>
+      <button data-tab="orders" class="tab">📦 Pedidos</button>
+      <button data-tab="stats" class="tab">📊 Estadísticas</button>
+      <button data-tab="inventory" class="tab">🏭 Inventario</button>
+      <button data-tab="config" class="tab">⚙️ Configuración</button>
+    </nav>
+
+    <main>
+      <!-- CALCULADORA -->
+      <section id="tab-calc" class="tab-pane active">
+        <div class="split">
+          <!-- PANEL DE ENTRADA -->
+          <div class="panel form-panel">
+            <div class="section-header">
+              <h2>📋 Detalles del Proyecto</h2>
+            </div>
+            <div class="grid2 mb12">
+              <label>
+                <span class="label-text">Empresa Emisora</span>
+                <select id="empresa"></select>
+              </label>
+              <label>
+                <span class="label-text">Cliente</span>
+                <input id="cliente" placeholder="Nombre del cliente" />
+              </label>
+              <label>
+                <span class="label-text">Fecha</span>
+                <input id="fecha" />
+              </label>
+              <label>
+                <span class="label-text">Descripción</span>
+                <input id="descripcion" placeholder="Ej: Pieza personalizada" />
+              </label>
+            </div>
+
+            <div class="section-header">
+              <h2>🖨️ Configuración de Impresión</h2>
+            </div>
+            <div class="grid2 mb12">
+              <label>
+                <span class="label-text">Impresora</span>
+                <select id="impresora"></select>
+              </label>
+              <label>
+                <span class="label-text">Material</span>
+                <select id="filamento"></select>
+              </label>
+              <label>
+                <span class="label-text">Color</span>
+                <select id="filamentoColor"></select>
+              </label>
+              <label>
+                <span class="label-text">Peso (gramos)</span>
+                <input id="peso" type="number" placeholder="50" />
+              </label>
+              <label>
+                <span class="label-text">Tiempo de impresión (horas)</span>
+                <input id="horas" type="number" step="0.1" placeholder="1.5" />
+              </label>
+            </div>
+            
+            <div class="checkbox-row mb12">
+              <label class="checkbox-label">
+                <input type="checkbox" id="isMultimaterial" />
+                <span>Multicolor / Multimaterial</span>
+              </label>
+              <button id="btnEditMix" class="btn btn-secondary">Configurar mezcla</button>
+            </div>
+            
+            <div class="info-boxes mb12">
+              <div class="info-box">
+                <span id="filPrice">—</span>
+              </div>
+              <div class="info-box">
+                <span id="energyHint">—</span>
+              </div>
+            </div>
+
+            <div class="section-header">
+              <h2>⚙️ Factores de Coste</h2>
+            </div>
+            <div class="grid2 mb12">
+              <label>
+                <span class="label-text">Diseño y modelado</span>
+                <select id="diseno"></select>
+              </label>
+              <label>
+                <span class="label-text">Búsqueda de modelos</span>
+                <select id="busqueda"></select>
+              </label>
+              <label>
+                <span class="label-text">Eliminación de soportes</span>
+                <select id="soportes"></select>
+              </label>
+              <label>
+                <span class="label-text">Postprocesado</span>
+                <select id="postproc"></select>
+              </label>
+              <label>
+                <span class="label-text">Probabilidad de error</span>
+                <select id="probError"></select>
+              </label>
+              <label>
+                <span class="label-text">Markup</span>
+                <select id="markup"></select>
+              </label>
+              <label>
+                <span class="label-text">Urgencia</span>
+                <select id="urgencia"></select>
+              </label>
+            </div>
+
+            <button id="btnCalculate" class="btn btn-primary btn-large">
+              ⚡ CALCULAR PRESUPUESTO
+            </button>
+          </div>
+
+          <!-- PANEL DE RESULTADOS -->
+          <div class="panel result-panel">
+            <div class="kpis kpis-3">
+              <article class="kpi kpi-primary">
+                <small>PRECIO FINAL</small>
+                <strong id="kpiPrecio">—</strong>
+              </article>
+              <article class="kpi kpi-success">
+                <small>BENEFICIO NETO</small>
+                <strong id="kpiBeneficio">—</strong>
+              </article>
+              <article class="kpi kpi-neutral">
+                <small>COSTE BRUTO</small>
+                <strong id="kpiCoste">—</strong>
+              </article>
+            </div>
+
+            <div class="breakdown-section">
+              <div class="section-header-small">
+                <strong>💰 DESGLOSE DE COSTES</strong>
+                <span id="markupInfo" class="hint"></span>
+              </div>
+              <div id="breakdownRows"></div>
+            </div>
+
+            <div class="charts-section">
+              <div class="chart-container">
+                <canvas id="calcDonut"></canvas>
+              </div>
+              <div class="chart-container">
+                <canvas id="calcBars"></canvas>
+              </div>
+            </div>
+
+            <div class="actions-bottom">
+              <button id="btnTicketCliente" class="btn btn-secondary">
+                📄 Ticket Cliente
+              </button>
+              <button id="btnTicketEmpresa" class="btn btn-secondary">
+                📄 Ticket Empresa
+              </button>
+              <button id="btnSaveOrder" class="btn btn-success">
+                📦 Guardar Pedido
+              </button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- PEDIDOS -->
+      <section id="tab-orders" class="tab-pane">
+        <div class="kpis kpis-4 mb16">
+          <article class="kpi kpi-neutral">
+            <small>TOTAL PEDIDOS</small>
+            <strong id="ordersTotal">0</strong>
+          </article>
+          <article class="kpi kpi-warning">
+            <small>ENVIADOS</small>
+            <strong id="ordersEnviados">0</strong>
+          </article>
+          <article class="kpi kpi-success">
+            <small>ACEPTADOS</small>
+            <strong id="ordersAceptados">0</strong>
+          </article>
+          <article class="kpi kpi-primary">
+            <small>FACTURACIÓN</small>
+            <strong id="ordersFacturacion">0.00 €</strong>
+          </article>
+        </div>
+
+        <div class="table-wrap mb16">
+          <table id="ordersTable">
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>Fecha</th>
+                <th>Cliente</th>
+                <th>Descripción</th>
+                <th>Material</th>
+                <th>Color</th>
+                <th>Multi</th>
+                <th>Peso</th>
+                <th>Urgencia</th>
+                <th>Precio</th>
+                <th>Beneficio</th>
+                <th>Estado</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+
+        <div class="actions-group">
+          <div class="action-section">
+            <strong>Estado del Pedido:</strong>
+            <button id="btnOrderAccepted" class="btn btn-success">✓ Marcar Aceptado</button>
+            <button id="btnOrderSent" class="btn btn-warning">↩ Marcar Enviado</button>
+            <button id="btnOrderDelete" class="btn btn-danger">✕ Eliminar</button>
+          </div>
+          <div class="action-section">
+            <strong>Pagos Stripe:</strong>
+            <button id="btnOrderPayLink" class="btn btn-primary">💳 Generar Link</button>
+            <button id="btnOrderCopyLink" class="btn btn-secondary">🔗 Copiar Link</button>
+            <button id="btnOrderOpenLink" class="btn btn-secondary">🌐 Abrir Link</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- ESTADÍSTICAS -->
+      <section id="tab-stats" class="tab-pane">
+        <div class="kpis kpis-5 mb16">
+          <article class="kpi kpi-primary">
+            <small>INGRESOS TOTALES</small>
+            <strong id="stIngresos">0.00 €</strong>
+          </article>
+          <article class="kpi kpi-danger">
+            <small>COSTES TOTALES</small>
+            <strong id="stCostes">0.00 €</strong>
+          </article>
+          <article class="kpi kpi-success">
+            <small>BENEFICIO NETO</small>
+            <strong id="stBeneficio">0.00 €</strong>
+          </article>
+          <article class="kpi kpi-neutral">
+            <small>MARGEN MEDIO</small>
+            <strong id="stMargen">0%</strong>
+          </article>
+          <article class="kpi kpi-accent">
+            <small>TICKET MEDIO</small>
+            <strong id="stTicket">0.00 €</strong>
+          </article>
+        </div>
+        
+        <div class="charts-section charts-large">
+          <div class="chart-container">
+            <h3 class="chart-title">Comparativa por Pedido</h3>
+            <canvas id="statsBars"></canvas>
+          </div>
+          <div class="chart-container">
+            <h3 class="chart-title">Ingresos por Material</h3>
+            <canvas id="statsDonut"></canvas>
+          </div>
+        </div>
+      </section>
+
+      <!-- INVENTARIO -->
+      <section id="tab-inventory" class="tab-pane">
+        <div class="inventory-grid">
+          <!-- IMPRESORAS -->
+          <div class="inventory-section">
+            <div class="section-header">
+              <h2>🖨️ Impresoras</h2>
+            </div>
+            <div class="actions mb12">
+              <button id="btnPrinterAdd" class="btn btn-success">+ Añadir</button>
+              <button id="btnPrinterEdit" class="btn btn-secondary">✎ Editar</button>
+              <button id="btnPrinterDelete" class="btn btn-danger">✕ Eliminar</button>
+            </div>
+            <div class="table-wrap">
+              <table id="printersTable">
+                <thead>
+                  <tr>
+                    <th>Nombre</th>
+                    <th>Diámetro</th>
+                    <th>Precio</th>
+                    <th>Vida útil</th>
+                    <th>Servicio</th>
+                    <th>Consumo</th>
+                    <th>Depreciación</th>
+                  </tr>
+                </thead>
+                <tbody></tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- FILAMENTOS -->
+          <div class="inventory-section">
+            <div class="section-header">
+              <h2>🎨 Materiales</h2>
+            </div>
+            <div class="actions mb12">
+              <button id="btnFilAdd" class="btn btn-success">+ Añadir</button>
+              <button id="btnFilEdit" class="btn btn-secondary">✎ Editar</button>
+              <button id="btnFilDelete" class="btn btn-danger">✕ Eliminar</button>
+            </div>
+            <div class="table-wrap">
+              <table id="filamentsTable">
+                <thead>
+                  <tr>
+                    <th>Nombre</th>
+                    <th>Precio (€/kg)</th>
+                  </tr>
+                </thead>
+                <tbody></tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- STOCK -->
+          <div class="inventory-section">
+            <div class="section-header">
+              <h2>📦 Stock de Rollos</h2>
+            </div>
+            <div class="actions mb12">
+              <button id="btnStockAdd" class="btn btn-success">+ Añadir Rollo</button>
+              <button id="btnStockEdit" class="btn btn-secondary">✎ Editar</button>
+              <button id="btnStockDelete" class="btn btn-danger">✕ Eliminar</button>
+            </div>
+            <div class="table-wrap">
+              <table id="stockTable">
+                <thead>
+                  <tr>
+                    <th>Material</th>
+                    <th>Color</th>
+                    <th>Restante (g)</th>
+                    <th>Mínimo (g)</th>
+                    <th>Estado</th>
+                  </tr>
+                </thead>
+                <tbody></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- CONFIGURACIÓN -->
+      <section id="tab-config" class="tab-pane">
+        <div class="config-container">
+          <div class="panel form-panel">
+            <div class="section-header">
+              <h2>⚙️ Parámetros Globales</h2>
+            </div>
+            <div class="grid2 mb12">
+              <label>
+                <span class="label-text">Coste energía (€/kWh)</span>
+                <input id="cfgEnergy" type="number" step="0.01" placeholder="0.15" />
+              </label>
+              <label>
+                <span class="label-text">Mano de obra (€/h)</span>
+                <input id="cfgLabor" type="number" step="0.1" placeholder="15" />
+              </label>
+              <label>
+                <span class="label-text">Precio mínimo</span>
+                <input id="cfgMinPrice" type="number" step="0.1" placeholder="5" />
+              </label>
+              <label>
+                <span class="label-text">Unidad monetaria</span>
+                <input id="cfgUnit" placeholder="€" />
+              </label>
+            </div>
+
+            <div class="section-header">
+              <h2>💳 Configuración Stripe</h2>
+            </div>
+            <div class="grid1 mb12">
+              <label>
+                <span class="label-text">Stripe Secret Key</span>
+                <input id="cfgStripeKey" type="password" placeholder="sk_test_..." />
+              </label>
+              <label>
+                <span class="label-text">URL de éxito</span>
+                <input id="cfgStripeSuccess" placeholder="https://..." />
+              </label>
+              <label>
+                <span class="label-text">URL de cancelación</span>
+                <input id="cfgStripeCancel" placeholder="https://..." />
+              </label>
+            </div>
+
+            <button id="btnSaveConfig" class="btn btn-primary btn-large">
+              💾 Guardar Configuración
+            </button>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <!-- DIÁLOGOS -->
+    <dialog id="textDialog" class="dialog-large">
+      <div class="dialog-header">
+        <h3 id="textDialogTitle">Ticket</h3>
+      </div>
+      <div class="dialog-body">
+        <textarea id="textDialogBody" readonly></textarea>
+      </div>
+      <div class="dialog-footer">
+        <button id="btnDialogCopy" class="btn btn-secondary">📋 Copiar</button>
+        <button id="btnDialogPdf" class="btn btn-primary">💾 Guardar PDF</button>
+        <button id="btnDialogClose" class="btn">Cerrar</button>
+      </div>
+    </dialog>
+
+    <dialog id="mixDialog" class="dialog-medium">
+      <div class="dialog-header">
+        <h3>🎨 Configurar Mezcla de Materiales</h3>
+      </div>
+      <div class="dialog-body">
+        <label class="mb12">
+          <span class="label-text">Número de materiales/colores (2-4)</span>
+          <select id="mixCount">
+            <option>2</option>
+            <option>3</option>
+            <option>4</option>
+          </select>
+        </label>
+        <div id="mixRows"></div>
+      </div>
+      <div class="dialog-footer">
+        <button id="btnMixSave" class="btn btn-primary">✓ Guardar</button>
+        <button id="btnMixCancel" class="btn btn-secondary">✕ Cancelar</button>
+      </div>
+    </dialog>
+
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+    <script src="./renderer.js"></script>
+  </body>
+</html>
