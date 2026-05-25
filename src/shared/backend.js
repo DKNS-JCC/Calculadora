@@ -34,9 +34,13 @@ export const POSTPROCESADO = {
 }
 
 export const PROBABILIDAD_ERROR = {
-  Baja: 0.25,
-  Media: 1,
-  Alta: 2,
+  'Exenta (0%)': 0,
+  'Mínima (10%)': 0.1,
+  'Baja (25%)': 0.25,
+  'Media (50%)': 0.5,
+  'Alta (100%)': 1,
+  'Muy Alta (150%)': 1.5,
+  'Crítica (200%)': 2,
 }
 
 export const MARKUP = {
@@ -118,6 +122,7 @@ export function createDefaultData() {
       stripe_success_url: 'https://example.com/pago-exitoso',
       stripe_cancel_url: 'https://example.com/pago-cancelado',
       pdf_default_path: '',
+      brand_color: '#3b82f6',
       email_enabled: false,
       email_from: '',
       email_app_password: '',
@@ -144,7 +149,7 @@ export function createDefaultData() {
       eliminacion_soportes: 'No',
       deterioro_impresora: 'Autofinanciación',
       postprocesado: 'No',
-      probabilidad_error: 'Baja',
+      probabilidad_error: 'Baja (25%)',
       markup: 'Normal (230%)',
       urgencia_nivel: 'Normal',
       gasto_misc: 0,
@@ -188,6 +193,7 @@ function normalizeOrder(input) {
   const order = {
     ...input,
     id: String(input?.id || generateId()),
+    created_at: String(input?.created_at || new Date().toISOString()),
     fecha: normalizeDate(String(input?.fecha || '')),
     empresa: String(input?.empresa || '3DCC'),
     cliente: String(input?.cliente || ''),
@@ -266,7 +272,7 @@ export function normalizeData(raw) {
   const probErrorKey = String(data.calc_state.probabilidad_error ?? '')
   data.calc_state.probabilidad_error = Object.prototype.hasOwnProperty.call(PROBABILIDAD_ERROR, probErrorKey)
     ? probErrorKey
-    : 'Baja'
+    : 'Baja (25%)'
   data.calc_state.urgencia_nivel = URGENCIA[data.calc_state.urgencia_nivel] !== undefined
     ? data.calc_state.urgencia_nivel
     : 'Normal'
@@ -455,7 +461,7 @@ export function calculateBudget(data, payload) {
   const payloadProbErrorNum = Number(payloadProbError)
   const errorRate = Object.prototype.hasOwnProperty.call(PROBABILIDAD_ERROR, payloadProbErrorKey)
     ? Number(PROBABILIDAD_ERROR[payloadProbErrorKey])
-    : (Number.isFinite(payloadProbErrorNum) ? payloadProbErrorNum : Number(PROBABILIDAD_ERROR.Baja))
+    : (Number.isFinite(payloadProbErrorNum) ? payloadProbErrorNum : Number(PROBABILIDAD_ERROR['Baja (25%)'] || 0.25))
   const urgenciaRate = URGENCIA[payload.urgencia_nivel] ?? 0
 
   const bd = calculateCost({
@@ -883,90 +889,132 @@ export function getTickets(resultInfo) {
   const bd = resultInfo.breakdown
   const breakdownDict = resultInfo.breakdownDict || costAsDict(bd)
   const entries = Object.entries(breakdownDict).map(([name, val]) => ({ name, value: Number(val || 0) }))
-  const subtotalVal = entries.reduce((acc, item) => acc + item.value, 0)
+  
   const isBruto = (label) => ['Filamento', 'Electricidad', 'Deterioro imp.', 'Desgaste impresora'].includes(String(label || '').trim())
   const costeBruto = entries.filter((item) => isBruto(item.name)).reduce((acc, item) => acc + item.value, 0)
+  const brutoVal = costeBruto
+  const complementoVal = entries.filter((item) => !isBruto(item.name)).reduce((acc, item) => acc + item.value, 0)
+  
   const cantidad = Math.max(1, Math.floor(Number(info.cantidad) || 1))
   const precioTotal = Number(info.precio_final || 0)
   const precioUnitario = roundMoney(precioTotal / cantidad)
-  const beneficioNeto = precioTotal - costeBruto
+  
+  const errorRate = Number(info.error_rate || 0)
+  const markup = Number(info.markup || 1)
+  const markupVal = Math.max(0, costeBruto * (markup - 1))
+  const errorVal = Math.max(0, costeBruto * errorRate)
+  const recargoUrgencia = Number(info.recargo_urgencia || 0)
+  
+  // Real Net Benefit
+  const beneficioNeto = markupVal + errorVal + recargoUrgencia
+
+  const fillRight = (text, len) => text.padEnd(len, ' ')
+  const fillLeft = (text, len) => text.padStart(len, ' ')
+
+  const SEP  = '  ================================================'
+  const SEP2 = '  ------------------------------------------------'
+  const HDR  = '  ████████████████████████████████████████████████'
 
   const clienteLines = [
-    '══════════════════════════════════════════',
-    `${info.empresa} · RESUMEN`,
-    '══════════════════════════════════════════',
-    `Cliente:      ${info.cliente}`,
-    `Fecha:        ${info.fecha}`,
-    `Descripción:  ${info.descripcion}`,
     '',
-    `Material:     ${info.filamento} (${info.filamento_color || '-'})`,
-    `Peso:         ${info.peso} g`,
-    `Tiempo est.:  ${info.horas} h`,
-    `Urgencia:     ${info.urgencia_nivel}`,
-    '──────────────────────────────────────────',
+    HDR,
+    `  ██  ${fillRight(info.empresa.toUpperCase(), 40)}  ██`,
+    `  ██  ${fillRight('PRESUPUESTO / RESUMEN DE PEDIDO', 40)}  ██`,
+    HDR,
     '',
-    `Precio ud.:   ${precioUnitario.toFixed(2)} ${info.unit}`,
-    `Cantidad:     ${cantidad}`,
-    `TOTAL:        ${precioTotal.toFixed(2)} ${info.unit}`,
+    SEP2,
+    `  CLIENTE  : ${info.cliente}`,
+    `  FECHA    : ${info.fecha}`,
+    `  PROYECTO : ${info.descripcion}`,
+    SEP2,
     '',
-    '──────────────────────────────────────────',
-    'Condiciones:',
-    '· El coste indicado es el precio final del proyecto, incluyendo todos los gastos necesarios.',
-    '· Para plazos estándar, el tiempo de entrega dependerá de la complejidad y cola de trabajo.',
-    '· Se requiere el abono del 50% del presupuesto como anticipo para iniciar la producción.',
-    '· Nuestros términos y condiciones están disponibles en nuestra web.',
-    '══════════════════════════════════════════',
+    '  DETALLES DEL TRABAJO',
+    `    Material  : ${info.filamento} — ${info.filamento_color || '-'}`,
+    `    Peso est. : ${info.peso} g`,
+    `    Tiempo    : ${info.horas} h`,
+    `    Urgencia  : ${info.urgencia_nivel}`,
+    '',
+    SEP,
+    '  PRESUPUESTO',
+    SEP,
+    `    Precio unitario  : ${fillLeft(precioUnitario.toFixed(2), 8)} ${info.unit}`,
+    `    Cantidad         : ${fillLeft(cantidad.toString(), 8)} ud.`,
+    SEP2,
+    `    TOTAL A ABONAR   : ${fillLeft(precioTotal.toFixed(2), 8)} ${info.unit}`,
+    SEP,
+    '',
+    '  CONDICIONES',
+    '    · Precio final cerrado, incluye todos los costes.',
+    '    · Plazo sujeto a cola de impresión y complejidad.',
+    '    · Se solicita 50% de anticipo para confirmar.',
+    '',
+    SEP2,
+    '',
   ]
 
   const empresaLines = [
-    '══════════════════════════════════════════════',
-    `${info.empresa} · DESGLOSE INTERNO`,
-    '══════════════════════════════════════════════',
-    `Cliente:      ${info.cliente}`,
-    `Fecha:        ${info.fecha}`,
-    `Descripción:  ${info.descripcion}`,
-    `Impresora:    ${info.impresora}`,
-    '──────────────────────────────────────────────',
-    `Material:     ${info.filamento} (${info.filamento_color || '-'}) (${Number(info.precio_kg || 0).toFixed(2)} ${info.unit}/kg)`,
-    `Peso:         ${info.peso} g`,
-    `Tiempo:       ${info.horas} h`,
-    `Cantidad:     ${cantidad}`,
-    '──────────────────────────────────────────────',
-    `Coste bruto (filamento + luz + desgaste): ${costeBruto.toFixed(2)} ${info.unit}`,
-    '──────────────────────────────────────────────',
-    'COSTES (por unidad):',
+    '',
+    HDR,
+    `  ██  ${fillRight(info.empresa.toUpperCase(), 40)}  ██`,
+    `  ██  ${fillRight('HOJA INTERNA DE TALLER', 40)}  ██`,
+    HDR,
+    '',
+    SEP2,
+    `  CLIENTE   : ${info.cliente}`,
+    `  PROYECTO  : ${info.descripcion}`,
+    `  IMPRESORA : ${info.impresora}`,
+    `  MATERIAL  : ${info.filamento} (${info.filamento_color || '-'}) — ${info.peso} g — ${info.horas} h`,
+    SEP2,
+    '',
+    `  DESGLOSE DE COSTES  (${cantidad} ud.)`,
+    '',
+    '  ── COSTE BRUTO (Materia Prima + Maquinaria) ──',
   ]
 
-  entries.forEach((item) => {
-    const pct = subtotalVal > 0 ? (item.value / subtotalVal) * 100 : 0
-    empresaLines.push(`  ${item.name}: ${item.value.toFixed(2)} ${info.unit} (${pct.toFixed(1)}%)`)
+  entries.filter(i => isBruto(i.name)).forEach(item => {
+    empresaLines.push(`    ${fillRight(item.name, 22)} ${fillLeft(item.value.toFixed(2), 7)} ${info.unit}`)
   })
+  empresaLines.push(SEP2)
+  empresaLines.push(`    ${fillRight('SUBTOTAL BRUTO', 22)} ${fillLeft(brutoVal.toFixed(2), 7)} ${info.unit}`)
+  empresaLines.push('')
 
-  empresaLines.push(
-    '──────────────────────────────────────────────',
-    `Subtotal: ${subtotalVal.toFixed(2)} ${info.unit}`,
-    `+ Error (${Math.round(Number(info.error_rate || 0) * 100)}%): ${Number(info.con_error || 0).toFixed(2)} ${info.unit}`,
-    `Markup ×${Number(info.markup || 2.3).toFixed(2)}`,
-  )
-
-  if (Number(info.urgencia_rate || 0) > 0) {
-    empresaLines.push(`+ Urgencia (${Math.round(Number(info.urgencia_rate) * 100)}%): +${Number(info.recargo_urgencia || 0).toFixed(2)} ${info.unit}`)
+  if (complementoVal > 0) {
+    empresaLines.push('  ── COMPLEMENTOS (Mano de Obra + Extras) ──')
+    entries.filter(i => !isBruto(i.name)).forEach(item => {
+      empresaLines.push(`    ${fillRight(item.name, 22)} ${fillLeft(item.value.toFixed(2), 7)} ${info.unit}`)
+    })
+    empresaLines.push(SEP2)
+    empresaLines.push(`    ${fillRight('SUBTOTAL COMPLEMENTOS', 22)} ${fillLeft(complementoVal.toFixed(2), 7)} ${info.unit}`)
+    empresaLines.push('')
   }
+
+  empresaLines.push('  ── MÁRGENES Y BENEFICIO ──')
+  empresaLines.push(`    ${fillRight(`Markup (×${markup.toFixed(1)})`, 22)} +${fillLeft(markupVal.toFixed(2), 6)} ${info.unit}`)
+  if (errorVal > 0) {
+    empresaLines.push(`    ${fillRight(`Fondo Error (${info.prob_error})`, 22)} +${fillLeft(errorVal.toFixed(2), 6)} ${info.unit}`)
+  }
+  if (recargoUrgencia > 0) {
+    empresaLines.push(`    ${fillRight('Plus Urgencia', 22)} +${fillLeft(recargoUrgencia.toFixed(2), 6)} ${info.unit}`)
+  }
+  empresaLines.push(SEP2)
+  empresaLines.push(`    ${fillRight('BENEFICIO NETO', 22)} ${fillLeft(beneficioNeto.toFixed(2), 7)} ${info.unit}`)
+  empresaLines.push('')
 
   if (info.precio_minimo_aplicado) {
-    empresaLines.push(`(Precio mínimo aplicado: ${Number(info.precio_minimo || 0).toFixed(2)} ${info.unit})`)
+    empresaLines.push(`  * Tarifa mínima aplicada: ${Number(info.precio_minimo || 0).toFixed(2)} ${info.unit}`)
+    empresaLines.push('')
   }
 
-  empresaLines.push(
-    '──────────────────────────────────────────────',
-    `PRECIO UNITARIO: ${precioUnitario.toFixed(2)} ${info.unit}`,
-    `CANTIDAD: ${cantidad}`,
-    `PRECIO TOTAL: ${precioTotal.toFixed(2)} ${info.unit}`,
-    `BENEFICIO NETO: ${beneficioNeto.toFixed(2)} ${info.unit}`,
-    '══════════════════════════════════════════════',
-    `Parámetros: Diseño=${info.diseno}; Búsqueda=${info.busqueda}; Soportes=${info.soportes}; Deterioro=${info.deterioro}; Postproc=${info.postproc}; Error=${info.prob_error}; Urgencia=${info.urgencia_nivel}`,
-    '══════════════════════════════════════════════',
-  )
+  empresaLines.push(SEP)
+  empresaLines.push(`    ${fillRight('PRECIO UNITARIO', 22)} ${fillLeft(precioUnitario.toFixed(2), 7)} ${info.unit}`)
+  empresaLines.push(`    ${fillRight('CANTIDAD', 22)} ${fillLeft(cantidad.toString(), 7)} ud.`)
+  empresaLines.push(SEP2)
+  empresaLines.push(`    ${fillRight('PVP FINAL', 22)} ${fillLeft(precioTotal.toFixed(2), 7)} ${info.unit}`)
+  empresaLines.push(SEP)
+  empresaLines.push('')
+  empresaLines.push(`  Opciones: Dis=${info.diseno} | Busq=${info.busqueda} | Sop=${info.soportes}`)
+  empresaLines.push(`            Post=${info.postproc} | Err=${info.prob_error} | Urg=${info.urgencia_nivel}`)
+  empresaLines.push('')
 
   return { cliente: clienteLines.join('\n'), empresa: empresaLines.join('\n') }
 }

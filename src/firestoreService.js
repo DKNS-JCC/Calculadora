@@ -39,6 +39,7 @@ export function empresaSlug(name) {
 
 function configRef(slug)          { return doc(db, 'empresas', slug, 'data', 'config') }
 function inventoryRef(slug)       { return doc(db, 'empresas', slug, 'data', 'inventory') }
+function clientsRef(slug)         { return doc(db, 'empresas', slug, 'data', 'clients') }
 function calcStateRef(slug)       { return doc(db, 'empresas', slug, 'data', 'calc_state') }
 function orderRef(slug, orderId)  { return doc(db, 'empresas', slug, 'orders', orderId) }
 function ordersCol(slug)          { return collection(db, 'empresas', slug, 'orders') }
@@ -56,18 +57,20 @@ function legacyRef(slug)          { return doc(db, 'empresas', slug) }
 export async function loadAllData(empresaName) {
   const slug = empresaSlug(empresaName)
 
-  const [cfgSnap, invSnap, csSnap, ordSnap] = await Promise.all([
+  const [cfgSnap, invSnap, clSnap, csSnap, ordSnap] = await Promise.all([
     getDoc(configRef(slug)),
     getDoc(inventoryRef(slug)),
+    getDoc(clientsRef(slug)),
     getDoc(calcStateRef(slug)),
     getDocs(ordersCol(slug)),
   ])
 
-  const hasNewData = cfgSnap.exists() || invSnap.exists() || csSnap.exists() || ordSnap.size > 0
+  const hasNewData = cfgSnap.exists() || invSnap.exists() || clSnap.exists() || csSnap.exists() || ordSnap.size > 0
 
   if (hasNewData) {
     const cfg = cfgSnap.exists() ? cfgSnap.data() : {}
     const inv = invSnap.exists() ? invSnap.data() : {}
+    const cl  = clSnap.exists()  ? clSnap.data()  : {}
     const cs  = csSnap.exists()  ? csSnap.data()  : null
     const orders = []
     ordSnap.forEach((d) => orders.push({ id: d.id, ...d.data() }))
@@ -78,6 +81,7 @@ export async function loadAllData(empresaName) {
       global_config: cfg.global_config || null,
       purge_config: cfg.purge_config || null,
       filament_stock: inv.filament_stock || null,
+      clients: cl.clients || [],
       calc_state: cs,
       orders,
     }
@@ -128,6 +132,10 @@ export async function saveInventory(empresaName, filament_stock) {
 
 export async function saveCalcState(empresaName, calc_state) {
   await setDoc(calcStateRef(empresaSlug(empresaName)), _json(calc_state))
+}
+
+export async function saveClients(empresaName, clients) {
+  await setDoc(clientsRef(empresaSlug(empresaName)), _json({ clients }))
 }
 
 export async function saveOrder(empresaName, order) {

@@ -2,7 +2,6 @@
 import { ref, computed } from 'vue'
 import Button from 'primevue/button'
 import InputText from 'primevue/inputtext'
-import Password from 'primevue/password'
 import Message from 'primevue/message'
 import SelectButton from 'primevue/selectbutton'
 

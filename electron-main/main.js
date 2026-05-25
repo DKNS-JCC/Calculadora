@@ -709,27 +709,39 @@ ipcMain.handle('dialog:select-folder', async () => {
 function setupAutoUpdater() {
   if (!app.isPackaged) return;
 
+  // Usa el log de la consola para el updater (ayuda a depurar si se capturan los logs)
+  autoUpdater.logger = console;
   autoUpdater.autoDownload = true;
   autoUpdater.autoInstallOnAppQuit = true;
 
-  autoUpdater.on('update-downloaded', async () => {
-    const { response } = await dialog.showMessageBox(mainWindow, {
+  autoUpdater.on('update-downloaded', () => {
+    dialog.showMessageBox(mainWindow, {
       type: 'info',
-      buttons: ['Reiniciar ahora', 'Más tarde'],
+      buttons: ['Reiniciar y actualizar', 'Más tarde'],
       defaultId: 0,
       cancelId: 1,
       title: 'Actualización lista',
-      message: 'Se ha descargado una nueva versión. ¿Reiniciar para aplicarla?',
+      message: 'Se ha descargado una nueva versión. ¿Deseas reiniciar la aplicación ahora para aplicar la actualización?',
+    }).then(({ response }) => {
+      if (response === 0) {
+        // Antes de instalar, nos aseguramos de que no haya bloqueos cerrando ventanas
+        // o desconectando eventos si fuera necesario. quitAndInstall hará el resto.
+        setImmediate(() => {
+          app.removeAllListeners('window-all-closed');
+          if (mainWindow) mainWindow.close();
+          autoUpdater.quitAndInstall(false, true);
+        });
+      }
     });
-    if (response === 0) autoUpdater.quitAndInstall();
   });
 
   autoUpdater.on('error', (err) => {
-    console.error('[updater]', err);
+    console.error('[updater] Error en la actualización:', err);
   });
 
+  // Comprobar actualizaciones al inicio
   autoUpdater.checkForUpdatesAndNotify().catch((err) => {
-    console.error('[updater] check failed', err);
+    console.error('[updater] Fallo al comprobar actualizaciones:', err);
   });
 }
 

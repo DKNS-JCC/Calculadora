@@ -1,11 +1,32 @@
 const crypto = require('crypto');
 const Stripe = require('stripe');
 
+/* ── Helpers ───────────────────────────────────────────────────────────── */
+
+function generateId() {
+  return crypto.randomUUID().replace(/-/g, '').slice(0, 8).toUpperCase();
+}
+
+function round4(value) {
+  return Math.round(Number(value || 0) * 10000) / 10000;
+}
+
+function roundMoney(value) {
+  return Math.round(Math.max(0, Number(value || 0)) * 100) / 100;
+}
+
+function roundUpToNickel(value) {
+  const amount = Math.max(0, Number(value || 0));
+  return Math.ceil((amount + Number.EPSILON) / 0.05) * 0.05;
+}
+
+/* ── Lookup tables ─────────────────────────────────────────────────────── */
+
 const DISENO_MODELADO = {
   'No necesario': 0,
   'Chorrada - En Slicer': 0.15,
-  "Fácil - Fusión 30'": 1/3,
-  "Medio - Fusión 60'": 2/3,
+  "Fácil - Fusión 30'": 1 / 3,
+  "Medio - Fusión 60'": 2 / 3,
   'Avanzado - AI + Remesh': 1,
 };
 
@@ -17,7 +38,7 @@ const BUSQUEDA_MODELOS = {
 const ELIMINACION_SOPORTES = {
   No: 0,
   'Pocos / Baja dificultad': 15,
-  'Muchos / Elevada dificultad': 25,
+  'Muchos / Elevada dificultad': 45,
 };
 
 const POSTPROCESADO = {
@@ -28,9 +49,13 @@ const POSTPROCESADO = {
 };
 
 const PROBABILIDAD_ERROR = {
-  Baja: 0.25,
-  Media: 1,
-  Alta: 2,
+  'Exenta (0%)': 0,
+  'Mínima (10%)': 0.1,
+  'Baja (25%)': 0.25,
+  'Media (50%)': 0.5,
+  'Alta (100%)': 1,
+  'Muy Alta (150%)': 1.5,
+  'Crítica (200%)': 2,
 };
 
 const MARKUP = {
@@ -55,7 +80,6 @@ function normalizeEstado(value) {
   const v = String(value || '').trim();
   if (!v) return 'Presupuesto enviado';
   if (v === 'Enviado') return 'Presupuesto enviado';
-  if (ORDER_LIFECYCLE.includes(v)) return v;
   return v;
 }
 
@@ -92,6 +116,7 @@ function createDefaultData() {
       stripe_success_url: 'https://example.com/pago-exitoso',
       stripe_cancel_url: 'https://example.com/pago-cancelado',
       pdf_default_path: '',
+      brand_color: '#3b82f6',
       email_enabled: false,
       email_from: '',
       email_app_password: '',
@@ -118,7 +143,7 @@ function createDefaultData() {
       eliminacion_soportes: 'No',
       deterioro_impresora: 'Autofinanciación',
       postprocesado: 'No',
-      probabilidad_error: 'Baja',
+      probabilidad_error: 'Baja (25%)',
       markup: 'Normal (230%)',
       urgencia_nivel: 'Normal',
       gasto_misc: 0,
@@ -155,7 +180,7 @@ function normalizeData(raw) {
   const probErrorKey = String(data.calc_state.probabilidad_error ?? '');
   data.calc_state.probabilidad_error = Object.prototype.hasOwnProperty.call(PROBABILIDAD_ERROR, probErrorKey)
     ? probErrorKey
-    : 'Baja';
+    : 'Baja (25%)';
   data.calc_state.urgencia_nivel = URGENCIA[data.calc_state.urgencia_nivel] !== undefined
     ? data.calc_state.urgencia_nivel
     : 'Normal';
@@ -195,7 +220,8 @@ function refreshOrderPaymentFields(order) {
 function normalizeOrder(input) {
   const order = {
     ...input,
-    id: String(input?.id || crypto.randomUUID().replace(/-/g, '').slice(0, 8).toUpperCase()),
+    id: String(input?.id || generateId()),
+    created_at: String(input?.created_at || new Date().toISOString()),
     fecha: normalizeDate(String(input?.fecha || '')),
     empresa: String(input?.empresa || '3DCC'),
     cliente: String(input?.cliente || ''),
@@ -241,7 +267,7 @@ function normalizeOrder(input) {
     archived: !!input?.archived,
     payment_history: Array.isArray(input?.payment_history)
       ? input.payment_history.map((p) => ({
-        id: String(p?.id || crypto.randomUUID().replace(/-/g, '').slice(0, 8).toUpperCase()),
+        id: String(p?.id || generateId()),
         created_at: String(p?.created_at || new Date().toISOString()),
         method: String(p?.method || 'Manual'),
         amount: roundMoney(p?.amount || 0),
@@ -460,7 +486,7 @@ function calculateBudget(data, payload) {
   const payloadProbErrorNum = Number(payloadProbError);
   const errorRate = Object.prototype.hasOwnProperty.call(PROBABILIDAD_ERROR, payloadProbErrorKey)
     ? Number(PROBABILIDAD_ERROR[payloadProbErrorKey])
-    : (Number.isFinite(payloadProbErrorNum) ? payloadProbErrorNum : Number(PROBABILIDAD_ERROR.Baja));
+    : (Number.isFinite(payloadProbErrorNum) ? payloadProbErrorNum : Number(PROBABILIDAD_ERROR['Baja (25%)'] || 0.25));
   const urgenciaRate = URGENCIA[payload.urgencia_nivel] ?? 0;
 
   const bd = calculateCost({
@@ -634,20 +660,22 @@ function recalculateOrder(data, params) {
   order.urgencia_nivel = info.urgencia_nivel || 'Normal';
   order.urgencia_rate = Number(info.urgencia_rate || 0);
   order.recargo_urgencia = roundMoney(info.recargo_urgencia || 0);
+  order.gasto_misc = roundMoney(info.gasto_misc || 0);
 
+  // Store cost-factor labels
   order.diseno_modelado = payload.diseno_modelado || 'No necesario';
   order.busqueda_modelos = payload.busqueda_modelos || 'No';
   order.eliminacion_soportes = payload.eliminacion_soportes || 'No';
   order.postprocesado_label = payload.postprocesado || 'No';
-  order.probabilidad_error_label = payload.probabilidad_error || 'Baja';
+  order.probabilidad_error_label = payload.probabilidad_error || 'Baja (25%)';
   order.markup_label = payload.markup || 'Normal (230%)';
 
+  // Shared order
   order.is_shared = !!payload.is_shared;
   order.shared_split = payload.is_shared ? {
     '3DCC': Number(payload.shared_percent_3dcc ?? 50),
     'SILAB3D': Number(payload.shared_percent_silab3d ?? 50),
   } : null;
-  order.gasto_misc = roundMoney(info.gasto_misc || 0);
 
   const newPrice = order.precio_final;
   const delta = roundMoney(newPrice - oldPrice);
@@ -655,7 +683,7 @@ function recalculateOrder(data, params) {
     const sign = delta > 0 ? '+' : '';
     if (!Array.isArray(order.payment_history)) order.payment_history = [];
     order.payment_history.push({
-      id: crypto.randomUUID().replace(/-/g, '').slice(0, 8).toUpperCase(),
+      id: generateId(),
       created_at: new Date().toISOString(),
       method: 'Modificación',
       amount: 0,
@@ -923,7 +951,7 @@ function addManualOrderPayment(data, params) {
 
   if (!Array.isArray(order.payment_history)) order.payment_history = [];
   order.payment_history.push({
-    id: crypto.randomUUID().replace(/-/g, '').slice(0, 8).toUpperCase(),
+    id: generateId(),
     created_at: new Date().toISOString(),
     method,
     amount,
@@ -968,93 +996,120 @@ function removeOrderPaymentRecord(data, params) {
 }
 
 function getTickets(resultInfo) {
-  const info = resultInfo.info;
-  const bd = resultInfo.breakdown;
-  const breakdownDict = resultInfo.breakdownDict || costAsDict(bd);
-  const entries = Object.entries(breakdownDict).map(([name, val]) => ({ name, value: Number(val || 0) }));
-  const subtotalVal = entries.reduce((acc, item) => acc + item.value, 0);
-  const isBruto = (label) => ['Filamento', 'Electricidad', 'Deterioro imp.', 'Desgaste impresora'].includes(String(label || '').trim());
-  const costeBruto = entries.filter((item) => isBruto(item.name)).reduce((acc, item) => acc + item.value, 0);
-  const cantidad = Math.max(1, Math.floor(Number(info.cantidad) || 1));
-  const precioTotal = Number(info.precio_final || 0);
-  const precioUnitario = roundMoney(precioTotal / cantidad);
-  const beneficioNeto = precioTotal - costeBruto;
+  const info = resultInfo.info
+  const bd = resultInfo.breakdown
+  const breakdownDict = resultInfo.breakdownDict || costAsDict(bd)
+  const entries = Object.entries(breakdownDict).map(([name, val]) => ({ name, value: Number(val || 0) }))
+
+  const isBruto = (label) => ['Filamento', 'Electricidad', 'Deterioro imp.', 'Desgaste impresora'].includes(String(label || '').trim())
+  const costeBruto = entries.filter((item) => isBruto(item.name)).reduce((acc, item) => acc + item.value, 0)
+  const brutoVal = costeBruto
+  const complementoVal = entries.filter((item) => !isBruto(item.name)).reduce((acc, item) => acc + item.value, 0)
+
+  const cantidad = Math.max(1, Math.floor(Number(info.cantidad) || 1))
+  const precioTotal = Number(info.precio_final || 0)
+  const precioUnitario = roundMoney(precioTotal / cantidad)
+
+  const errorRate = Number(info.error_rate || 0)
+  const markup = Number(info.markup || 1)
+  const markupVal = Math.max(0, costeBruto * (markup - 1))
+  const errorVal = Math.max(0, costeBruto * errorRate)
+  const recargoUrgencia = Number(info.recargo_urgencia || 0)
+
+  // Real Net Benefit
+  const beneficioNeto = markupVal + errorVal + recargoUrgencia
+
+  const fillRight = (text, len) => text.padEnd(len, ' ')
+  const fillLeft = (text, len) => text.padStart(len, ' ')
 
   const clienteLines = [
-    '══════════════════════════════════════════',
-    `${info.empresa} · RESUMEN`,
-    '══════════════════════════════════════════',
-    `Cliente:      ${info.cliente}`,
-    `Fecha:        ${info.fecha}`,
-    `Descripción:  ${info.descripcion}`,
+    '┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓',
+    `┃  ${fillRight((info.empresa + ' · RESUMEN DE PEDIDO').toUpperCase(), 44)}  ┃`,
+    '┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛',
     '',
-    `Material:     ${info.filamento} (${info.filamento_color || '-'})`,
-    `Peso:         ${info.peso} g`,
-    `Tiempo est.:  ${info.horas} h`,
-    `Urgencia:     ${info.urgencia_nivel}`,
-    '──────────────────────────────────────────',
+    `  CLIENTE:      ${info.cliente}`,
+    `  FECHA:        ${info.fecha}`,
+    `  PROYECTO:     ${info.descripcion}`,
     '',
-    `Precio ud.:   ${precioUnitario.toFixed(2)} ${info.unit}`,
-    `Cantidad:     ${cantidad}`,
-    `TOTAL:        ${precioTotal.toFixed(2)} ${info.unit}`,
+    '  [ DETALLES TÉCNICOS ]',
+    `  • Material:   ${info.filamento} (${info.filamento_color || '-'})`,
+    `  • Peso est.:  ${info.peso} g`,
+    `  • Tiempo req: ${info.horas} h`,
+    `  • Urgencia:   ${info.urgencia_nivel}`,
     '',
-    '══════════════════════════════════════════',
-  ];
+    '  [ PRESUPUESTO ]',
+    `  Precio unitario:       ${fillLeft(precioUnitario.toFixed(2), 7)} ${info.unit}`,
+    `  Cantidad:              ${fillLeft(cantidad.toString(), 7)} ud.`,
+    '  ────────────────────────────────────────────────',
+    `  TOTAL A ABONAR:        ${fillLeft(precioTotal.toFixed(2), 7)} ${info.unit}`,
+    '  ────────────────────────────────────────────────',
+    '',
+    '  📝 TÉRMINOS Y CONDICIONES',
+    '  • El coste arriba reflejado es el precio final cerrado e',
+    '    incluye todos los gastos del proceso productivo.',
+    '  • Si no se ha acordado una entrega express, el tiempo final',
+    '    vendrá marcado por la cola de impresión y complejidad.',
+    '  • Se solicita un 50% por adelantado para confirmar el encargo.',
+    '',
+  ]
 
   const empresaLines = [
-    '══════════════════════════════════════════════',
-    `${info.empresa} · DESGLOSE INTERNO`,
-    '══════════════════════════════════════════════',
-    `Cliente:      ${info.cliente}`,
-    `Fecha:        ${info.fecha}`,
-    `Descripción:  ${info.descripcion}`,
-    `Impresora:    ${info.impresora}`,
-    '──────────────────────────────────────────────',
-    `Material:     ${info.filamento} (${info.filamento_color || '-'}) (${Number(info.precio_kg || 0).toFixed(2)} ${info.unit}/kg)`,
-    `Peso:         ${info.peso} g`,
-    `Tiempo:       ${info.horas} h`,
-    `Cantidad:     ${cantidad}`,
-    '──────────────────────────────────────────────',
-    `Coste bruto (filamento + luz + desgaste): ${costeBruto.toFixed(2)} ${info.unit}`,
-    '──────────────────────────────────────────────',
-    'COSTES (por unidad):',
-  ];
+    '┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓',
+    `┃  ${fillRight((info.empresa + ' · HOJA INTERNA DE TALLER').toUpperCase(), 44)}  ┃`,
+    '┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛',
+    '',
+    `  CLIENTE:      ${info.cliente}`,
+    `  PROYECTO:     ${info.descripcion}`,
+    `  IMPRESORA:    ${info.impresora}`,
+    '',
+    `  [ DESGLOSE DE COSTES (${cantidad} ud.) ]`,
+  ]
 
-  entries.forEach((item) => {
-    const pct = subtotalVal > 0 ? (item.value / subtotalVal) * 100 : 0;
-    empresaLines.push(`  ${item.name}: ${item.value.toFixed(2)} ${info.unit} (${pct.toFixed(1)}%)`);
-  });
+  // BRUTO
+  empresaLines.push('  ▼ Materia Prima y Maquinaria (Bruto)')
+  entries.filter(i => isBruto(i.name)).forEach(item => {
+    empresaLines.push(`    • ${fillRight(item.name, 19)}: ${fillLeft(item.value.toFixed(2), 6)} ${info.unit}`)
+  })
+  empresaLines.push(`    > SUBTOTAL BRUTO ........: ${fillLeft(brutoVal.toFixed(2), 6)} ${info.unit}`)
+  empresaLines.push('')
 
-  empresaLines.push(
-    '──────────────────────────────────────────────',
-    `Subtotal: ${subtotalVal.toFixed(2)} ${info.unit}`,
-    `+ Error (${Math.round(Number(info.error_rate || 0) * 100)}%): ${Number(info.con_error || 0).toFixed(2)} ${info.unit}`,
-    `Markup ×${Number(info.markup || 2.3).toFixed(2)}`,
-  );
-
-  if (Number(info.urgencia_rate || 0) > 0) {
-    empresaLines.push(`+ Urgencia (${Math.round(Number(info.urgencia_rate) * 100)}%): +${Number(info.recargo_urgencia || 0).toFixed(2)} ${info.unit}`);
+  // COMPLEMENTOS
+  if (complementoVal > 0) {
+    empresaLines.push('  ▼ Mano de Obra y Tareas Extra')
+    entries.filter(i => !isBruto(i.name)).forEach(item => {
+      empresaLines.push(`    • ${fillRight(item.name, 19)}: ${fillLeft(item.value.toFixed(2), 6)} ${info.unit}`)
+    })
+    empresaLines.push(`    > SUBTOTAL M.OBRA .......: ${fillLeft(complementoVal.toFixed(2), 6)} ${info.unit}`)
+    empresaLines.push('')
   }
+
+  // MARGEN
+  empresaLines.push('  ▼ Márgenes y Beneficio')
+  empresaLines.push(`    • Beneficio Base (x${markup.toFixed(1)}) : +${fillLeft(markupVal.toFixed(2), 5)} ${info.unit}`)
+  if (errorVal > 0) {
+    empresaLines.push(`    • Fondo Error (${info.prob_error.substring(0, 6)})   : +${fillLeft(errorVal.toFixed(2), 5)} ${info.unit}`)
+  }
+  if (recargoUrgencia > 0) {
+    empresaLines.push(`    • Plus Urgencia         : +${fillLeft(recargoUrgencia.toFixed(2), 5)} ${info.unit}`)
+  }
+  empresaLines.push(`    > BENEFICIO NETO ........: ${fillLeft(beneficioNeto.toFixed(2), 6)} ${info.unit}`)
+  empresaLines.push('')
 
   if (info.precio_minimo_aplicado) {
-    empresaLines.push(`(Precio mínimo aplicado: ${Number(info.precio_minimo || 0).toFixed(2)} ${info.unit})`);
+    empresaLines.push(`  (Aviso: Se aplicó tarifa mínima de ${Number(info.precio_minimo || 0).toFixed(2)} ${info.unit})`)
   }
 
   empresaLines.push(
-    '──────────────────────────────────────────────',
-    `PRECIO UNITARIO: ${precioUnitario.toFixed(2)} ${info.unit}`,
-    `CANTIDAD: ${cantidad}`,
-    `PRECIO TOTAL: ${precioTotal.toFixed(2)} ${info.unit}`,
-    `BENEFICIO NETO: ${beneficioNeto.toFixed(2)} ${info.unit}`,
-    '══════════════════════════════════════════════',
-    `Parámetros: Diseño=${info.diseno}; Búsqueda=${info.busqueda}; Soportes=${info.soportes}; Deterioro=${info.deterioro}; Postproc=${info.postproc}; Error=${info.prob_error}; Urgencia=${info.urgencia_nivel}`,
-    '══════════════════════════════════════════════',
-  );
+    '  ────────────────────────────────────────────────',
+    `  PRECIO UNIDAD:     ${fillLeft(precioUnitario.toFixed(2), 7)} ${info.unit}`,
+    `  CANTIDAD TOTAL:    ${fillLeft(cantidad.toString(), 7)} ud.`,
+    `  PVP VENTA FINAL:   ${fillLeft(precioTotal.toFixed(2), 7)} ${info.unit}`,
+    '  ────────────────────────────────────────────────',
+    '',
+    `  [!] Opciones Elegidas: Dis=${info.diseno} | Busq=${info.busqueda} | Sop=${info.soportes} | Det=${info.deterioro} | Post=${info.postproc} | Err=${info.prob_error} | Urg=${info.urgencia_nivel}`
+  )
 
-  return {
-    cliente: clienteLines.join('\n'),
-    empresa: empresaLines.join('\n'),
-  };
+  return { cliente: clienteLines.join('\n'), empresa: empresaLines.join('\n') }
 }
 
 module.exports = {

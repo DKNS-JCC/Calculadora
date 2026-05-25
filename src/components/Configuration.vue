@@ -235,6 +235,13 @@ const selectPdfFolder = async () => {
                             <label class="text-sm font-medium">Precio Mínimo</label>
                             <InputNumber v-model="config.precio_minimo" :minFractionDigits="2" class="w-full" />
                         </div>
+                        <div class="flex flex-col gap-1">
+                            <label class="text-sm font-medium">Color de Marca (Botones y acentos)</label>
+                            <div class="flex items-center gap-2">
+                                <input type="color" v-model="config.brand_color" class="w-10 h-10 p-0 border-0 bg-transparent cursor-pointer rounded overflow-hidden" />
+                                <InputText v-model="config.brand_color" class="flex-1" placeholder="#3b82f6" />
+                            </div>
+                        </div>
                     </div>
                     <div v-if="isElectron()" class="flex flex-col gap-1">
                         <label class="text-sm font-medium">Carpeta predeterminada para PDFs</label>

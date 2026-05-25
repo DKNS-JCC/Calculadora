@@ -39,12 +39,46 @@ const OPTIONS = {
     soportes: ['No', 'Pocos / Baja dificultad', 'Muchos / Elevada dificultad'],
     postproc: ['No', 'Sencillo (Lijado ligero)', 'Medio (Lijado + Ensamblado)', 'Complejo (Lijado + Pintura)'],
     probError: [
-        { label: 'Baja', value: 'Baja' },
-        { label: 'Media (≈ 1 fallo)', value: 'Media' },
-        { label: 'Alta (≈ 2 fallos)', value: 'Alta' },
+        { label: 'Exenta (0%)', value: 'Exenta (0%)' },
+        { label: 'Mínima (10%)', value: 'Mínima (10%)' },
+        { label: 'Baja (25%)', value: 'Baja (25%)' },
+        { label: 'Media (50%)', value: 'Media (50%)' },
+        { label: 'Alta (100% ≈ 1 fallo)', value: 'Alta (100%)' },
+        { label: 'Muy Alta (150%)', value: 'Muy Alta (150%)' },
+        { label: 'Crítica (200% ≈ 2 fallos)', value: 'Crítica (200%)' },
     ],
     markup: ['Normal (230%)'],
     urgencia: ['Normal', 'Urgente'],
+    estabilidad: [
+        { label: 'Alta — Base ancha y sólida', value: 0 },
+        { label: 'Media — Esbelto / Contacto medio', value: 0.5 },
+        { label: 'Baja — Inestable / Mínimo contacto', value: 1.5 },
+    ],
+    materialDificultad: [
+        { label: 'Fácil — PLA, PETG, TPU', value: 0 },
+        { label: 'Medio — ASA, ABS, Madera', value: 0.5 },
+        { label: 'Difícil — Nylon, PC, Glow', value: 1.5 },
+    ],
+    esMulticolor: [
+        { label: 'No — Monocolor / Un solo material', value: 0 },
+        { label: 'Sí — Cambio de color / AMS / MMU', value: 1.5 },
+    ],
+    puestaAPunto: [
+        { label: 'Probado — Modelo ya impreso', value: 0 },
+        { label: 'Nuevo — Primer intento / Ajuste', value: 0.5 },
+        { label: 'Complejo — Requiere I+D / Fallos probables', value: 1.5 },
+    ],
+}
+
+const MATERIAL_RISK_MAP = {
+    'PLA': 0,
+    'PETG': 0.1,
+    'TPU': 0.3,
+    'ASA': 0.5,
+    'ABS': 0.6,
+    'PLA SILK/MARBLE': 0.2,
+    'NYLON': 1.0,
+    'CARBON': 1.2
 }
 
 /* ── Zod Validation ── */
@@ -78,14 +112,45 @@ const formFechaDate = computed({
 
 /* ── Client autocomplete ── */
 const clientSuggestions = ref([])
-const knownClients = computed(() =>
-    [...new Set((store.appData?.orders || []).map(o => o.cliente).filter(Boolean))].sort()
-)
+const clients = computed(() => store.appData.clients || [])
 const filterClients = (e) => {
     const q = (e.query || '').toLowerCase()
-    clientSuggestions.value = q
-        ? knownClients.value.filter(c => c.toLowerCase().includes(q))
-        : [...knownClients.value]
+    const all = clients.value.map(c => c.name)
+    clientSuggestions.value = q ? all.filter(c => c.toLowerCase().includes(q)) : all
+}
+
+const onClientSelect = (e) => {
+    const client = clients.value.find(c => c.name === e.value)
+    if (client) {
+        if (client.email) form.cliente_email = client.email
+        if (client.default_discount > 0) form.markup_label = `Descuento (${client.default_discount}%)`
+    }
+}
+
+
+const findLastEmailForClient = (name) => {
+    const target = String(name || '').trim().toLowerCase()
+    if (!target) return ''
+    const matches = (store.appData?.orders || []).filter(o =>
+        String(o.cliente || '').trim().toLowerCase() === target
+        && String(o.cliente_email || '').trim()
+    )
+    if (!matches.length) return ''
+    matches.sort((a, b) => String(b.created_at || b.fecha || '').localeCompare(String(a.created_at || a.fecha || '')))
+    return String(matches[0].cliente_email || '').trim()
+}
+
+let lastAutofilledEmail = ''
+const onClientSelected = () => {
+    const email = findLastEmailForClient(form.cliente)
+    const current = String(form.cliente_email || '').trim()
+    if (email && (!current || current === lastAutofilledEmail)) {
+        form.cliente_email = email
+        lastAutofilledEmail = email
+    } else if (!email && current && current === lastAutofilledEmail) {
+        form.cliente_email = ''
+        lastAutofilledEmail = ''
+    }
 }
 
 const form = reactive({
@@ -113,6 +178,7 @@ const form = reactive({
     urgencia_nivel: OPTIONS.urgencia[0],
     gasto_misc: 0,
 })
+watch(() => form.cliente, onClientSelected)
 
 const HEX_COLOR_MAP = {
     Negro: '#111827',
@@ -132,6 +198,46 @@ const normalizeHex = (value) => {
     const raw = String(value || '').trim().replace('#', '')
     if (!raw) return '#94A3B8'
     return `#${raw}`
+}
+
+const riskDialog = ref(false)
+const indiceError = reactive({ estabilidad: 0, material: 0, puesta: 0, multicolor: 0 })
+
+const openRiskDialog = () => {
+    // Sincronizar con el estado actual de multimaterial del formulario
+    indiceError.multicolor = form.is_multimaterial ? 1.5 : 0
+    riskDialog.value = true
+}
+
+const indiceErrorSugerido = computed(() => {
+    let score = 0
+
+    // 1. Material Factor (Base risk from selection)
+    const matBase = String(form.filamento_tipo || '').toUpperCase()
+    for (const [key, val] of Object.entries(MATERIAL_RISK_MAP)) {
+        if (matBase.includes(key)) { score = val; break }
+    }
+
+    // 2. Time Exposure
+    score += (Number(form.tiempo_h || 0) / 15) * 0.5
+
+    // 3. Questionnaire Subjective Factors (4 questions)
+    score += (Number(indiceError.estabilidad) || 0)
+    score += (Number(indiceError.material) || 0)
+    score += (Number(indiceError.puesta) || 0)
+    score += (Number(indiceError.multicolor) || 0)
+
+    if (score <= 0.2) return 'Exenta (0%)'
+    if (score <= 0.6) return 'Mínima (10%)'
+    if (score <= 1.2) return 'Baja (25%)'
+    if (score <= 2.2) return 'Media (50%)'
+    if (score <= 3.5) return 'Alta (100%)'
+    if (score <= 5.0) return 'Muy Alta (150%)'
+    return 'Crítica (200%)'
+})
+const applyIndiceError = () => {
+    form.probabilidad_error = indiceErrorSugerido.value
+    riskDialog.value = false
 }
 
 const getColorOptionsByMaterial = (material) => {
@@ -170,7 +276,6 @@ const mixLines = reactive([
     { material: '', color: '', grams: 0 },
     { material: '', color: '', grams: 0 },
 ])
-let calcMixBreakdown = []
 
 const addMixLine = () => {
     mixLines.push({ material: form.filamento_tipo || '', color: '', grams: 0 })
@@ -226,13 +331,13 @@ const detailedBreakdown = computed(() => {
         value: Number(value || 0)
     }))
 
-    // Section 1 — Bruto: raw material + energy costs
-    const isBrutoRaw = (label) => label === 'Filamento' || label === 'Electricidad'
+    // Section 1 — Bruto: raw material + energy costs + depreciation
+    const isBrutoRaw = (label) => label === 'Filamento' || label === 'Electricidad' || label === 'Deterioro imp.'
     const brutoRows = allRows.filter((row) => isBrutoRaw(row.label))
     const brutoTotal = brutoRows.reduce((acc, row) => acc + row.value, 0)
 
-    // Section 2 — Complementos: depreciation + labor costs
-    const isComplemento = (label) => !isBrutoRaw(label) && label !== 'Extras / Misc.'
+    // Section 2 — Complementos: labor costs + extras
+    const isComplemento = (label) => !isBrutoRaw(label)
     const complementosRows = allRows.filter((row) => isComplemento(row.label))
     const complementosTotal = complementosRows.reduce((acc, row) => acc + row.value, 0)
 
@@ -244,7 +349,6 @@ const detailedBreakdown = computed(() => {
     const markupSupplement = Math.max(0, costeBrutoFormula * (markup - 1))
     const errorSupplement = Math.max(0, costeBrutoFormula * errorRate)
     const recargoUrgencia = Number(info.recargo_urgencia || 0)
-    const gastoMisc = Number(info.gasto_misc || 0)
     const beneficioTotal = markupSupplement + errorSupplement + recargoUrgencia
 
     return {
@@ -255,7 +359,7 @@ const detailedBreakdown = computed(() => {
         markupSupplement,
         errorSupplement,
         recargoUrgencia,
-        gastoMisc,
+        gastoMisc: Number(info.gasto_misc || 0),
         beneficioTotal,
         markup,
         errorRate,
@@ -308,10 +412,9 @@ onMounted(() => {
         gasto_misc: Number(cs.gasto_misc || 0),
     })
     if (cs.material_breakdown && Array.isArray(cs.material_breakdown)) {
-        calcMixBreakdown = cs.material_breakdown.map(l => ({ material: l.material, color: l.color, grams: l.grams }))
         // Reset reactive array to match saved breakdown
         mixLines.splice(0, mixLines.length)
-        calcMixBreakdown.forEach((line) => {
+        cs.material_breakdown.forEach((line) => {
             mixLines.push({ material: line.material, color: line.color, grams: line.grams })
         })
         // Ensure at least 2 lines
@@ -328,9 +431,13 @@ let _saveTimer = null
 watch(form, () => {
     clearTimeout(_saveTimer)
     _saveTimer = setTimeout(() => {
+        const material_breakdown = form.is_multimaterial 
+            ? mixLines.filter(l => l.material && l.color && l.grams > 0).map(l => ({ ...l }))
+            : []
+
         store.saveCalcState(structuredClone({
             ...form,
-            material_breakdown: calcMixBreakdown,
+            material_breakdown,
             deterioro_impresora: 'Autofinanciación'
         }))
     }, 600)
@@ -340,7 +447,6 @@ onUnmounted(() => clearTimeout(_saveTimer))
 // Sync mix breakdown whenever mix lines change
 watch(mixLines, () => {
     if (!form.is_multimaterial) return
-    calcMixBreakdown = mixLines.filter(l => l.material && l.color && l.grams > 0).map(l => ({ ...l }))
     form.peso_g = mixTotalGrams.value
 }, { deep: true })
 
@@ -366,9 +472,13 @@ const calculate = async () => {
         return
     }
     try {
+        const material_breakdown = form.is_multimaterial 
+            ? mixLines.filter(l => l.material && l.color && l.grams > 0).map(l => ({ ...l }))
+            : []
+            
         const payload = structuredClone({
             ...form,
-            material_breakdown: calcMixBreakdown,
+            material_breakdown,
             deterioro_impresora: 'Autofinanciación'
         })
         const res = await store.calculate(payload)
@@ -657,129 +767,91 @@ const exportBothPdfs = async () => {
 </script>
 
 <template>
-    <div>
-    <!-- Context strip -->
-    <div v-if="store.isLoaded && (pendingCount > 0 || pendingAmount > 0)" class="flex flex-wrap gap-2 mb-1">
-        <div v-if="pendingCount > 0" class="flex items-center gap-1.5 px-3 py-1.5 rounded-full card text-xs font-medium text-amber-700 dark:text-amber-300">
-            <i class="pi pi-clock text-[10px]" />
-            <span>{{ pendingCount }} por cobrar</span>
+    <div class="flex flex-col gap-4">
+        <!-- Context strip -->
+        <div v-if="store.isLoaded && (pendingCount > 0 || pendingAmount > 0)" class="flex flex-wrap gap-2 mb-1">
+            <div v-if="pendingCount > 0" class="flex items-center gap-1.5 px-3 py-1.5 rounded-full card text-xs font-medium text-amber-700 dark:text-amber-300">
+                <i class="pi pi-clock text-[10px]" />
+                <span>{{ pendingCount }} por cobrar</span>
+            </div>
+            <div v-if="pendingAmount > 0" class="flex items-center gap-1.5 px-3 py-1.5 rounded-full card text-xs font-medium text-red-700 dark:text-red-300">
+                <i class="pi pi-euro text-[10px]" />
+                <span>{{ pendingAmount.toFixed(2) }} {{ calcUnit }} pendiente</span>
+            </div>
+            <div class="flex items-center gap-1.5 px-3 py-1.5 rounded-full card text-xs font-medium text-emerald-700 dark:text-emerald-300">
+                <i class="pi pi-chart-line text-[10px]" />
+                <span>{{ thisMonthRevenue.toFixed(2) }} {{ calcUnit }} este mes</span>
+            </div>
         </div>
-        <div v-if="pendingAmount > 0" class="flex items-center gap-1.5 px-3 py-1.5 rounded-full card text-xs font-medium text-red-700 dark:text-red-300">
-            <i class="pi pi-euro text-[10px]" />
-            <span>{{ pendingAmount.toFixed(2) }} {{ calcUnit }} pendiente</span>
-        </div>
-        <div class="flex items-center gap-1.5 px-3 py-1.5 rounded-full card text-xs font-medium text-emerald-700 dark:text-emerald-300">
-            <i class="pi pi-chart-line text-[10px]" />
-            <span>{{ thisMonthRevenue.toFixed(2) }} {{ calcUnit }} este mes</span>
-        </div>
-    </div>
-    <div class="flex flex-col 2xl:flex-row gap-6">
-        <!-- LEFT: Form -->
-        <div class="w-full 2xl:w-[420px] 2xl:shrink-0 flex flex-col gap-4 min-w-0">
-            <Panel header="Proyecto" toggleable :pt="{ root: { class: 'card rounded-2xl border-0 overflow-hidden' }, header: { class: '!bg-transparent border-b border-black/[0.05] dark:border-white/[0.06] px-4 py-3' }, content: { class: '!bg-transparent p-4' } }">
-                <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                    <div class="flex flex-col gap-1">
-                        <label class="text-sm text-surface-400">Empresa</label>
-                        <InputText :modelValue="store.empresa" class="w-full" disabled />
-                    </div>
-                    <div class="flex flex-col gap-1">
-                        <label class="text-sm text-surface-400">Cliente</label>
-                        <AutoComplete v-model="form.cliente" :suggestions="clientSuggestions" @complete="filterClients" dropdownMode="blank" dropdown class="w-full" :invalid="!!errors.cliente" />
-                    </div>
-                    <div class="flex flex-col gap-1">
-                        <label class="text-sm text-surface-400">Fecha</label>
-                        <DatePicker v-model="formFechaDate" dateFormat="dd/mm/yy" showIcon iconDisplay="input" class="w-full" :invalid="!!errors.fecha" />
-                    </div>
-                    <div class="flex flex-col gap-1">
-                        <label class="text-sm text-surface-400">Descripción</label>
-                        <InputText v-model="form.descripcion" class="w-full" :invalid="!!errors.descripcion" />
-                    </div>
-                    <div class="flex flex-col gap-1 sm:col-span-2">
-                        <label class="text-sm text-surface-400 flex items-center gap-1.5">
-                            <i class="pi pi-envelope text-xs" />
-                            Email del cliente
-                            <span class="text-xs text-surface-300 dark:text-white/30">— opcional, para notificaciones automáticas</span>
-                        </label>
-                        <InputText v-model="form.cliente_email" type="email" placeholder="cliente@ejemplo.com" class="w-full" :invalid="!!errors.cliente_email" />
-                        <small v-if="errors.cliente_email" class="text-red-500">{{ errors.cliente_email }}</small>
-                    </div>
-                </div>
-                <div class="flex items-center gap-3 mt-3 p-3 bg-surface-100 dark:bg-surface-800 rounded-lg">
-                    <Checkbox v-model="form.is_shared" binary inputId="shared" />
-                    <label for="shared" class="text-sm cursor-pointer font-medium">Pedido compartido (3DCC + SILAB3D)</label>
-                </div>
-                <div v-if="form.is_shared" class="mt-3 p-3 border border-indigo-200 dark:border-indigo-800 bg-indigo-50 dark:bg-indigo-950/30 rounded-lg">
-                    <div class="flex items-center justify-between mb-2">
-                        <span class="text-sm font-semibold text-indigo-600 dark:text-indigo-400">Reparto de retribución</span>
-                        <span class="text-xs text-surface-500">Total: {{ form.shared_percent_3dcc + form.shared_percent_silab3d }}%</span>
-                    </div>
-                    <div class="flex items-center gap-4">
-                        <div class="flex flex-col items-center gap-1 min-w-[80px]">
-                            <span class="text-xs font-semibold text-blue-500">3DCC</span>
-                            <span class="text-lg font-bold text-blue-600 dark:text-blue-400">{{ form.shared_percent_3dcc }}%</span>
-                        </div>
-                        <Slider v-model="form.shared_percent_3dcc" :min="0" :max="100" :step="5" class="flex-1"
-                            @update:modelValue="(v) => { form.shared_percent_silab3d = 100 - v }" />
-                        <div class="flex flex-col items-center gap-1 min-w-[80px]">
-                            <span class="text-xs font-semibold text-purple-500">SILAB3D</span>
-                            <span class="text-lg font-bold text-purple-600 dark:text-purple-400">{{ form.shared_percent_silab3d }}%</span>
-                        </div>
-                    </div>
-                </div>
-            </Panel>
 
-            <Panel header="Impresión" toggleable :pt="{ root: { class: 'card rounded-2xl border-0 overflow-hidden' }, header: { class: '!bg-transparent border-b border-black/[0.05] dark:border-white/[0.06] px-4 py-3' }, content: { class: '!bg-transparent p-4' } }">
-                <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 overflow-hidden">
-                    <div class="flex flex-col gap-1 min-w-0">
-                        <label class="text-sm text-surface-400">Impresora</label>
-                        <Select v-model="form.impresora" :options="printerOptions" class="w-full" :invalid="!!errors.impresora" />
-                    </div>
-                    <div class="flex flex-col gap-1 min-w-0">
-                        <label class="text-sm text-surface-400">Material</label>
-                        <Select v-model="form.filamento_tipo" :options="filamentOptions" class="w-full" :invalid="!!errors.filamento_tipo" />
-                    </div>
-                    <div class="flex flex-col gap-1 min-w-0 overflow-hidden">
-                        <label class="text-sm text-surface-400">Color</label>
-                        <Select v-model="form.filamento_color" :options="colorOptions" optionLabel="label" optionValue="value" :disabled="form.is_multimaterial" class="w-full">
-                            <template #option="slotProps">
-                                <div class="flex items-center gap-2">
-                                    <span class="inline-block w-3 h-3 rounded-full border border-surface-300 dark:border-surface-600" :style="{ backgroundColor: slotProps.option.hex || colorHex(slotProps.option.value) }" />
-                                    <span>{{ slotProps.option.label }}</span>
-                                </div>
-                            </template>
-                        </Select>
-                    </div>
-                    <div class="flex flex-col gap-1 min-w-0">
-                        <label class="text-sm text-surface-400">Peso (g)</label>
-                        <InputNumber v-model="form.peso_g" :disabled="form.is_multimaterial" class="w-full" :pt="{ root: { class: 'w-full' }, input: { style: 'width:100%;min-width:0' } }" :invalid="!!errors.peso_g" />
-                    </div>
-                    <div class="flex flex-col gap-1 min-w-0">
-                        <label class="text-sm text-surface-400">Tiempo (h)</label>
-                        <InputNumber v-model="form.tiempo_h" :minFractionDigits="1" class="w-full" :pt="{ root: { class: 'w-full' }, input: { style: 'width:100%;min-width:0' } }" :invalid="!!errors.tiempo_h" />
-                    </div>
-                    <div class="flex flex-col gap-1 min-w-0">
-                        <label class="text-sm text-surface-400">Cantidad (ud.)</label>
-                        <InputNumber v-model="form.cantidad" :min="1" :step="1" class="w-full" :pt="{ root: { class: 'w-full' }, input: { style: 'width:100%;min-width:0' } }" />
-                    </div>
-                </div>
-                <div class="flex items-center gap-3 mt-3 p-2 bg-surface-100 dark:bg-surface-800 rounded-lg">
-                    <Checkbox v-model="form.is_multimaterial" binary inputId="multi" />
-                    <label for="multi" class="text-sm cursor-pointer">Multicolor / Multimaterial</label>
-                </div>
-                <!-- Inline multicolor rows -->
-                <div v-if="form.is_multimaterial" class="mt-3 flex flex-col gap-2 p-3 border border-amber-200 dark:border-amber-800 bg-amber-50 dark:bg-amber-950/20 rounded-lg">
-                    <div class="flex items-center justify-between mb-1">
-                        <span class="text-xs font-semibold text-amber-600 dark:text-amber-400 uppercase tracking-wide">Mezcla de colores</span>
-                        <Button icon="pi pi-plus" size="small" text severity="success" @click="addMixLine" v-tooltip.top="'Añadir color'" />
-                    </div>
-                    <div v-for="(line, idx) in mixLines" :key="idx" class="grid gap-1 items-end overflow-hidden" :style="{ gridTemplateColumns: mixLines.length > 2 ? '6rem 1fr 4.5rem 3.5rem 2rem' : '6rem 1fr 4.5rem 3.5rem' }">
-                        <div class="flex flex-col gap-1 overflow-hidden">
-                            <label v-if="idx === 0" class="text-[11px] text-surface-400">Material</label>
-                            <Select v-model="line.material" :options="filamentOptions" placeholder="Material" class="w-full" @update:modelValue="onMixMaterialChange(idx)" />
+        <div class="flex flex-col 2xl:flex-row gap-6">
+            <!-- LEFT: Form -->
+            <div class="w-full 2xl:w-[420px] 2xl:shrink-0 flex flex-col gap-4 min-w-0">
+                <Panel header="Proyecto" toggleable :pt="{ root: { class: 'card rounded-2xl border-0 overflow-hidden' }, header: { class: '!bg-transparent border-b border-black/[0.05] dark:border-white/[0.06] px-4 py-3' }, content: { class: '!bg-transparent p-4' } }">
+                    <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                        <div class="flex flex-col gap-1">
+                            <label class="text-sm text-surface-400">Empresa</label>
+                            <InputText :modelValue="store.empresa" class="w-full" disabled />
                         </div>
-                        <div class="flex flex-col gap-1 overflow-hidden">
-                            <label v-if="idx === 0" class="text-[11px] text-surface-400">Color</label>
-                            <Select v-model="line.color" :options="getColorOptionsByMaterial(line.material)" optionLabel="label" optionValue="value" placeholder="Color" class="w-full">
+                        <div class="flex flex-col gap-1">
+                            <label class="text-sm text-surface-400">Cliente</label>
+                            <AutoComplete v-model="form.cliente" :suggestions="clientSuggestions" @complete="filterClients" @select="onClientSelect" dropdownMode="blank" dropdown class="w-full" :invalid="!!errors.cliente" />
+                        </div>
+                        <div class="flex flex-col gap-1">
+                            <label class="text-sm text-surface-400">Fecha</label>
+                            <DatePicker v-model="formFechaDate" dateFormat="dd/mm/yy" showIcon iconDisplay="input" class="w-full" :invalid="!!errors.fecha" />
+                        </div>
+                        <div class="flex flex-col gap-1">
+                            <label class="text-sm text-surface-400">Descripción</label>
+                            <InputText v-model="form.descripcion" class="w-full" :invalid="!!errors.descripcion" />
+                        </div>
+                        <div class="flex flex-col gap-1 sm:col-span-2">
+                            <label class="text-sm text-surface-400 flex items-center gap-1.5">
+                                <i class="pi pi-envelope text-xs" />
+                                Email del cliente
+                                <span class="text-xs text-surface-300 dark:text-white/30">— opcional, para notificaciones automáticas</span>
+                            </label>
+                            <InputText v-model="form.cliente_email" type="email" placeholder="cliente@ejemplo.com" class="w-full" :invalid="!!errors.cliente_email" />
+                            <small v-if="errors.cliente_email" class="text-red-500">{{ errors.cliente_email }}</small>
+                        </div>
+                    </div>
+                    <div class="flex items-center gap-3 mt-3 p-3 bg-surface-100 dark:bg-surface-800 rounded-lg">
+                        <Checkbox v-model="form.is_shared" binary inputId="shared" />
+                        <label for="shared" class="text-sm cursor-pointer font-medium">Pedido compartido (3DCC + SILAB3D)</label>
+                    </div>
+                    <div v-if="form.is_shared" class="mt-3 p-3 border border-indigo-200 dark:border-indigo-800 bg-indigo-50 dark:bg-indigo-950/30 rounded-lg">
+                        <div class="flex items-center justify-between mb-2">
+                            <span class="text-sm font-semibold text-indigo-600 dark:text-indigo-400">Reparto de retribución</span>
+                            <span class="text-xs text-surface-500">Total: {{ form.shared_percent_3dcc + form.shared_percent_silab3d }}%</span>
+                        </div>
+                        <div class="flex items-center gap-4">
+                            <div class="flex flex-col items-center gap-1 min-w-[80px]">
+                                <span class="text-xs font-semibold text-blue-500">3DCC</span>
+                                <span class="text-lg font-bold text-blue-600 dark:text-blue-400">{{ form.shared_percent_3dcc }}%</span>
+                            </div>
+                            <Slider v-model="form.shared_percent_3dcc" :min="0" :max="100" :step="5" class="flex-1"
+                                @update:modelValue="(v) => { form.shared_percent_silab3d = 100 - v }" />
+                            <div class="flex flex-col items-center gap-1 min-w-[80px]">
+                                <span class="text-xs font-semibold text-purple-500">SILAB3D</span>
+                                <span class="text-lg font-bold text-purple-600 dark:text-purple-400">{{ form.shared_percent_silab3d }}%</span>
+                            </div>
+                        </div>
+                    </div>
+                </Panel>
+
+                <Panel header="Impresión" toggleable :pt="{ root: { class: 'card rounded-2xl border-0 overflow-hidden' }, header: { class: '!bg-transparent border-b border-black/[0.05] dark:border-white/[0.06] px-4 py-3' }, content: { class: '!bg-transparent p-4' } }">
+                    <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 overflow-hidden">
+                        <div class="flex flex-col gap-1 min-w-0">
+                            <label class="text-sm text-surface-400">Impresora</label>
+                            <Select v-model="form.impresora" :options="printerOptions" class="w-full" :invalid="!!errors.impresora" />
+                        </div>
+                        <div class="flex flex-col gap-1 min-w-0">
+                            <label class="text-sm text-surface-400">Material</label>
+                            <Select v-model="form.filamento_tipo" :options="filamentOptions" class="w-full" :invalid="!!errors.filamento_tipo" />
+                        </div>
+                        <div class="flex flex-col gap-1 min-w-0 overflow-hidden">
+                            <label class="text-sm text-surface-400">Color</label>
+                            <Select v-model="form.filamento_color" :options="colorOptions" optionLabel="label" optionValue="value" :disabled="form.is_multimaterial" class="w-full">
                                 <template #option="slotProps">
                                     <div class="flex items-center gap-2">
                                         <span class="inline-block w-3 h-3 rounded-full border border-surface-300 dark:border-surface-600" :style="{ backgroundColor: slotProps.option.hex || colorHex(slotProps.option.value) }" />
@@ -788,224 +860,309 @@ const exportBothPdfs = async () => {
                                 </template>
                             </Select>
                         </div>
-                        <div class="flex flex-col gap-1 overflow-hidden">
-                            <label v-if="idx === 0" class="text-[11px] text-surface-400">Peso (g)</label>
-                            <InputNumber v-model="line.grams" placeholder="g" suffix=" g" :inputStyle="{ width: '100%', minWidth: '0' }" class="w-full [&_input]:!w-full [&_input]:!min-w-0" />
+                        <div class="flex flex-col gap-1 min-w-0">
+                            <label class="text-sm text-surface-400">Peso (g)</label>
+                            <InputNumber v-model="form.peso_g" :disabled="form.is_multimaterial" class="w-full" :pt="{ root: { class: 'w-full' }, input: { style: 'width:100%;min-width:0' } }" :invalid="!!errors.peso_g" />
+                        </div>
+                        <div class="flex flex-col gap-1 min-w-0">
+                            <label class="text-sm text-surface-400">Tiempo (h)</label>
+                            <InputNumber v-model="form.tiempo_h" :minFractionDigits="1" class="w-full" :pt="{ root: { class: 'w-full' }, input: { style: 'width:100%;min-width:0' } }" :invalid="!!errors.tiempo_h" />
+                        </div>
+                        <div class="flex flex-col gap-1 min-w-0">
+                            <label class="text-sm text-surface-400">Cantidad (ud.)</label>
+                            <InputNumber v-model="form.cantidad" :min="1" :step="1" class="w-full" :pt="{ root: { class: 'w-full' }, input: { style: 'width:100%;min-width:0' } }" />
+                        </div>
+                    </div>
+                    <div class="flex items-center gap-3 mt-3 p-2 bg-surface-100 dark:bg-surface-800 rounded-lg">
+                        <Checkbox v-model="form.is_multimaterial" binary inputId="multi" />
+                        <label for="multi" class="text-sm cursor-pointer">Multicolor / Multimaterial</label>
+                    </div>
+                    <!-- Inline multicolor rows -->
+                    <div v-if="form.is_multimaterial" class="mt-3 flex flex-col gap-2 p-3 border border-amber-200 dark:border-amber-800 bg-amber-50 dark:bg-amber-950/20 rounded-lg">
+                        <div class="flex items-center justify-between mb-1">
+                            <span class="text-xs font-semibold text-amber-600 dark:text-amber-400 uppercase tracking-wide">Mezcla de colores</span>
+                            <Button icon="pi pi-plus" size="small" text severity="success" @click="addMixLine" v-tooltip.top="'Añadir color'" />
+                        </div>
+                        <div v-for="(line, idx) in mixLines" :key="idx" class="grid gap-1 items-end overflow-hidden" :style="{ gridTemplateColumns: mixLines.length > 2 ? '6rem 1fr 4.5rem 3.5rem 2rem' : '6rem 1fr 4.5rem 3.5rem' }">
+                            <div class="flex flex-col gap-1 overflow-hidden">
+                                <label v-if="idx === 0" class="text-[11px] text-surface-400">Material</label>
+                                <Select v-model="line.material" :options="filamentOptions" placeholder="Material" class="w-full" @update:modelValue="onMixMaterialChange(idx)" />
+                            </div>
+                            <div class="flex flex-col gap-1 overflow-hidden">
+                                <label v-if="idx === 0" class="text-[11px] text-surface-400">Color</label>
+                                <Select v-model="line.color" :options="getColorOptionsByMaterial(line.material)" optionLabel="label" optionValue="value" placeholder="Color" class="w-full">
+                                    <template #option="slotProps">
+                                        <div class="flex items-center gap-2">
+                                            <span class="inline-block w-3 h-3 rounded-full border border-surface-300 dark:border-surface-600" :style="{ backgroundColor: slotProps.option.hex || colorHex(slotProps.option.value) }" />
+                                            <span>{{ slotProps.option.label }}</span>
+                                        </div>
+                                    </template>
+                                </Select>
+                            </div>
+                            <div class="flex flex-col gap-1 overflow-hidden">
+                                <label v-if="idx === 0" class="text-[11px] text-surface-400">Peso (g)</label>
+                                <InputNumber v-model="line.grams" placeholder="g" suffix=" g" :inputStyle="{ width: '100%', minWidth: '0' }" class="w-full [&_input]:!w-full [&_input]:!min-w-0" />
+                            </div>
+                            <div class="flex flex-col gap-1">
+                                <label v-if="idx === 0" class="text-[11px] text-surface-400">Gasto</label>
+                                <span class="text-xs font-mono font-semibold text-amber-600 dark:text-amber-400 py-2 text-right whitespace-nowrap">{{ mixLineCost(line).toFixed(2) }}{{ unit }}</span>
+                            </div>
+                            <Button v-if="mixLines.length > 2" icon="pi pi-times" size="small" text severity="danger" class="mb-0.5 self-end" @click="removeMixLine(idx)" v-tooltip.top="'Quitar'" />
+                        </div>
+                        <div class="flex items-center justify-between mt-2 pt-2 border-t border-amber-200 dark:border-amber-700">
+                            <span class="text-xs text-surface-500">Total: <strong>{{ mixTotalGrams.toFixed(0) }} g</strong></span>
+                            <span class="text-sm font-mono font-bold text-amber-600 dark:text-amber-400">{{ mixTotalCost.toFixed(2) }} {{ unit }}</span>
+                        </div>
+                    </div>
+                    <small v-if="filamentPrice" class="text-surface-400 mt-1 block">
+                        <i class="pi pi-info-circle mr-1" />{{ filamentPrice }}
+                    </small>
+                </Panel>
+
+                <Panel header="Factores de Coste" toggleable :pt="{ root: { class: 'card rounded-2xl border-0 overflow-hidden' }, header: { class: '!bg-transparent border-b border-black/[0.05] dark:border-white/[0.06] px-4 py-3' }, content: { class: '!bg-transparent p-4' } }">
+                    <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                        <div class="flex flex-col gap-1">
+                            <label class="text-sm text-surface-400">Diseño</label>
+                            <Select v-model="form.diseno_modelado" :options="OPTIONS.diseno" class="w-full" />
                         </div>
                         <div class="flex flex-col gap-1">
-                            <label v-if="idx === 0" class="text-[11px] text-surface-400">Gasto</label>
-                            <span class="text-xs font-mono font-semibold text-amber-600 dark:text-amber-400 py-2 text-right whitespace-nowrap">{{ mixLineCost(line).toFixed(2) }}{{ unit }}</span>
+                            <label class="text-sm text-surface-400">Búsqueda Modelos</label>
+                            <Select v-model="form.busqueda_modelos" :options="OPTIONS.busqueda" class="w-full" />
                         </div>
-                        <Button v-if="mixLines.length > 2" icon="pi pi-times" size="small" text severity="danger" class="mb-0.5 self-end" @click="removeMixLine(idx)" v-tooltip.top="'Quitar'" />
-                    </div>
-                    <div class="flex items-center justify-between mt-2 pt-2 border-t border-amber-200 dark:border-amber-700">
-                        <span class="text-xs text-surface-500">Total: <strong>{{ mixTotalGrams.toFixed(0) }} g</strong></span>
-                        <span class="text-sm font-mono font-bold text-amber-600 dark:text-amber-400">{{ mixTotalCost.toFixed(2) }} {{ unit }}</span>
-                    </div>
-                </div>
-                <small v-if="filamentPrice" class="text-surface-400 mt-1 block">
-                    <i class="pi pi-info-circle mr-1" />{{ filamentPrice }}
-                </small>
-            </Panel>
-
-            <Panel header="Factores de Coste" toggleable :pt="{ root: { class: 'card rounded-2xl border-0 overflow-hidden' }, header: { class: '!bg-transparent border-b border-black/[0.05] dark:border-white/[0.06] px-4 py-3' }, content: { class: '!bg-transparent p-4' } }">
-                <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                    <div class="flex flex-col gap-1">
-                        <label class="text-sm text-surface-400">Diseño</label>
-                        <Select v-model="form.diseno_modelado" :options="OPTIONS.diseno" class="w-full" />
-                    </div>
-                    <div class="flex flex-col gap-1">
-                        <label class="text-sm text-surface-400">Búsqueda Modelos</label>
-                        <Select v-model="form.busqueda_modelos" :options="OPTIONS.busqueda" class="w-full" />
-                    </div>
-                    <div class="flex flex-col gap-1">
-                        <label class="text-sm text-surface-400">Soportes</label>
-                        <Select v-model="form.eliminacion_soportes" :options="OPTIONS.soportes" class="w-full" />
-                    </div>
-                    <div class="flex flex-col gap-1">
-                        <label class="text-sm text-surface-400">Postprocesado</label>
-                        <Select v-model="form.postprocesado" :options="OPTIONS.postproc" class="w-full" />
-                    </div>
-                    <div class="flex flex-col gap-1">
-                        <label class="text-sm text-surface-400">Prob. Error</label>
-                        <Select v-model="form.probabilidad_error" :options="OPTIONS.probError" optionLabel="label" optionValue="value" class="w-full" />
-                    </div>
-                    <div class="flex flex-col gap-1">
-                        <label class="text-sm text-surface-400">Markup</label>
-                        <Select v-model="form.markup" :options="OPTIONS.markup" class="w-full" />
-                    </div>
-                    <div class="flex flex-col gap-1 col-span-2">
-                        <label class="text-sm text-surface-400">Urgencia</label>
-                        <Select v-model="form.urgencia_nivel" :options="OPTIONS.urgencia" class="w-full" />
-                    </div>
-                    <div class="flex flex-col gap-1 col-span-2">
-                        <label class="text-sm text-surface-400 flex items-center gap-1">
-                            <i class="pi pi-tag text-xs" /> Extras / Misceláneos
-                        </label>
-                        <InputNumber v-model="form.gasto_misc" :min="0" :minFractionDigits="2" :maxFractionDigits="2"
-                            class="w-full" placeholder="Anillas, llaveros, embalaje..." />
-                        <small class="text-surface-400">Importe directo añadido al precio final (sin markup)</small>
-                    </div>
-                </div>
-            </Panel>
-
-            <Button label="Calcular Presupuesto" icon="pi pi-bolt" @click="calculate" class="w-full" severity="info" size="large" />
-        </div>
-
-        <!-- RIGHT: Results -->
-        <div class="flex-1 min-w-0">
-            <div v-if="result" class="flex flex-col gap-4">
-                <!-- Summary Cards -->
-                <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
-                    <div class="bg-primary-50 dark:bg-primary-950/30 border border-primary-200 dark:border-primary-800 rounded-xl p-4 text-center">
-                        <div class="text-xs text-primary-600 dark:text-primary-400 font-semibold uppercase tracking-wide">Precio Total</div>
-                        <div class="text-2xl font-bold text-primary-700 dark:text-primary-300 mt-1">{{ summaryMetrics.precioFinal.toFixed(2) }} {{ unit }}</div>
-                        <div v-if="summaryMetrics.cantidad > 1" class="text-xs text-primary-500 mt-1">{{ summaryMetrics.cantidad }} ud. × {{ summaryMetrics.precioUnitario.toFixed(2) }} {{ unit }}/ud.</div>
-                    </div>
-                    <div class="bg-green-50 dark:bg-green-950/30 border border-green-200 dark:border-green-800 rounded-xl p-4 text-center">
-                        <div class="text-xs text-green-600 dark:text-green-400 font-semibold uppercase tracking-wide">Beneficio</div>
-                        <div class="text-2xl font-bold text-green-700 dark:text-green-300 mt-1">{{ summaryMetrics.beneficioNeto.toFixed(2) }} {{ unit }}</div>
-                    </div>
-                    <div class="card-inset rounded-xl p-4 text-center">
-                        <div class="text-xs text-surface-500 font-semibold uppercase tracking-wide">Coste Bruto</div>
-                        <div class="text-2xl font-bold mt-1">{{ summaryMetrics.costeBruto.toFixed(2) }} {{ unit }}</div>
-                    </div>
-                </div>
-
-                <!-- Shared Split Info -->
-                <div v-if="result.info.is_shared && result.info.shared_split" class="p-4 border border-indigo-200 dark:border-indigo-800 bg-indigo-50 dark:bg-indigo-950/30 rounded-xl">
-                    <div class="flex items-center gap-2 mb-3">
-                        <i class="pi pi-users text-indigo-500" />
-                        <span class="font-semibold text-indigo-600 dark:text-indigo-400">Pedido Compartido — Reparto</span>
-                    </div>
-                    <div class="grid grid-cols-2 gap-4">
-                        <div class="text-center p-3 bg-blue-50 dark:bg-blue-950/30 rounded-lg border border-blue-200 dark:border-blue-800">
-                            <div class="text-xs font-semibold text-blue-500 uppercase">3DCC ({{ result.info.shared_split['3DCC'] }}%)</div>
-                            <div class="text-xl font-bold text-blue-600 dark:text-blue-400 mt-1">{{ (result.info.precio_final * result.info.shared_split['3DCC'] / 100).toFixed(2) }} {{ unit }}</div>
+                        <div class="flex flex-col gap-1">
+                            <label class="text-sm text-surface-400">Soportes</label>
+                            <Select v-model="form.eliminacion_soportes" :options="OPTIONS.soportes" class="w-full" />
                         </div>
-                        <div class="text-center p-3 bg-purple-50 dark:bg-purple-950/30 rounded-lg border border-purple-200 dark:border-purple-800">
-                            <div class="text-xs font-semibold text-purple-500 uppercase">SILAB3D ({{ result.info.shared_split['SILAB3D'] }}%)</div>
-                            <div class="text-xl font-bold text-purple-600 dark:text-purple-400 mt-1">{{ (result.info.precio_final * result.info.shared_split['SILAB3D'] / 100).toFixed(2) }} {{ unit }}</div>
+                        <div class="flex flex-col gap-1">
+                            <label class="text-sm text-surface-400">Postprocesado</label>
+                            <Select v-model="form.postprocesado" :options="OPTIONS.postproc" class="w-full" />
                         </div>
-                    </div>
-                </div>
-
-                <!-- Breakdown -->
-                <Panel header="Desglose de Costes" :pt="{ root: { class: 'card rounded-2xl border-0 overflow-hidden' }, header: { class: '!bg-transparent border-b border-black/[0.05] dark:border-white/[0.06] px-4 py-3' }, content: { class: '!bg-transparent p-4' } }">
-                    <div class="flex flex-col gap-3">
-                        <!-- Sección 1: Bruto -->
-                        <div class="rounded-xl card-inset">
-                            <div class="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-surface-500 border-b border-black/[0.04] dark:border-white/[0.06]">
-                                Bruto <span class="font-normal normal-case">(filamento + electricidad)</span>
-                            </div>
-                            <div class="px-3 py-1">
-                                <div v-for="row in detailedBreakdown?.brutoRows || []" :key="`bruto-${row.label}`"
-                                    class="flex justify-between items-center py-2 border-b border-black/[0.04] dark:border-white/[0.06] last:border-0">
-                                    <span class="text-surface-600 dark:text-surface-300">{{ row.label }}</span>
-                                    <span class="font-mono font-semibold text-primary-600 dark:text-primary-400">{{ formatMoney(row.value) }}</span>
-                                </div>
-                                <div class="flex justify-between items-center py-2">
-                                    <span class="font-semibold text-surface-700 dark:text-surface-200">Subtotal bruto</span>
-                                    <span class="font-mono font-bold text-primary-600 dark:text-primary-400">{{ formatMoney(detailedBreakdown?.brutoTotal || 0) }}</span>
-                                </div>
+                        <div class="flex flex-col gap-1">
+                            <label class="text-sm text-surface-400">Prob. Error</label>
+                            <div class="flex gap-1">
+                                <InputText :modelValue="form.probabilidad_error" readonly class="flex-1" @click="openRiskDialog" />
+                                <Button icon="pi pi-question-circle" @click="openRiskDialog" severity="secondary" v-tooltip.top="'Calcular riesgo mediante cuestionario'" />
                             </div>
                         </div>
-
-                        <!-- Sección 2: Complementos -->
-                        <div class="rounded-xl card-inset">
-                            <div class="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-surface-500 border-b border-black/[0.04] dark:border-white/[0.06]">
-                                Complementos <span class="font-normal normal-case">(deterioro + mano de obra)</span>
-                            </div>
-                            <div class="px-3 py-1">
-                                <div v-for="row in detailedBreakdown?.complementosRows || []" :key="`comp-${row.label}`"
-                                    class="flex justify-between items-center py-2 border-b border-black/[0.04] dark:border-white/[0.06] last:border-0">
-                                    <span class="text-surface-600 dark:text-surface-300">{{ row.label }}</span>
-                                    <span class="font-mono font-semibold text-primary-600 dark:text-primary-400">{{ formatMoney(row.value) }}</span>
-                                </div>
-                                <div class="flex justify-between items-center py-2">
-                                    <span class="font-semibold text-surface-700 dark:text-surface-200">Subtotal complementos</span>
-                                    <span class="font-mono font-bold text-primary-600 dark:text-primary-400">{{ formatMoney(detailedBreakdown?.complementosTotal || 0) }}</span>
-                                </div>
-                            </div>
+                        <div class="flex flex-col gap-1">
+                            <label class="text-sm text-surface-400">Markup</label>
+                            <Select v-model="form.markup" :options="OPTIONS.markup" class="w-full" />
                         </div>
-
-                        <!-- Sección 3: Beneficio -->
-                        <div class="rounded-xl card-inset">
-                            <div class="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-surface-500 border-b border-black/[0.04] dark:border-white/[0.06]">
-                                Beneficio <span class="font-normal normal-case">(markup + error)</span>
-                            </div>
-                            <div class="px-3 py-1">
-                                <div class="flex justify-between items-center py-2 border-b border-black/[0.04] dark:border-white/[0.06]">
-                                    <span class="text-surface-600 dark:text-surface-300">Suplemento markup (×{{ (detailedBreakdown?.markup || 2.3).toFixed(2) }})</span>
-                                    <span class="font-mono font-semibold text-green-600 dark:text-green-400">+{{ formatMoney(detailedBreakdown?.markupSupplement || 0) }}</span>
-                                </div>
-                                <div class="flex justify-between items-center py-2 border-b border-black/[0.04] dark:border-white/[0.06]">
-                                    <span class="text-surface-600 dark:text-surface-300">
-                                        Suplemento error ({{ detailedBreakdown?.tasaErrorLabel }}{{ errorRepString }})
-                                    </span>
-                                    <span class="font-mono font-semibold text-amber-500">+{{ formatMoney(detailedBreakdown?.errorSupplement || 0) }}</span>
-                                </div>
-                                <div v-if="(detailedBreakdown?.recargoUrgencia || 0) > 0" class="flex justify-between items-center py-2 border-b border-black/[0.04] dark:border-white/[0.06]">
-                                    <span class="text-surface-600 dark:text-surface-300">Recargo urgencia</span>
-                                    <span class="font-mono font-semibold text-orange-500">+{{ formatMoney(detailedBreakdown?.recargoUrgencia || 0) }}</span>
-                                </div>
-                                <div v-if="(detailedBreakdown?.gastoMisc || 0) > 0" class="flex justify-between items-center py-2 border-b border-black/[0.04] dark:border-white/[0.06]">
-                                    <span class="text-surface-600 dark:text-surface-300 flex items-center gap-1"><i class="pi pi-tag text-xs" /> Extras / Misceláneos</span>
-                                    <span class="font-mono font-semibold text-amber-500">+{{ formatMoney(detailedBreakdown?.gastoMisc || 0) }}</span>
-                                </div>
-                                <div class="flex justify-between items-center py-2">
-                                    <span class="font-semibold text-surface-700 dark:text-surface-200">Subtotal beneficio</span>
-                                    <span class="font-mono font-bold text-green-600 dark:text-green-400">{{ formatMoney(detailedBreakdown?.beneficioTotal || 0) }}</span>
-                                </div>
-                            </div>
+                        <div class="flex flex-col gap-1 col-span-2">
+                            <label class="text-sm text-surface-400">Urgencia</label>
+                            <Select v-model="form.urgencia_nivel" :options="OPTIONS.urgencia" class="w-full" />
+                        </div>
+                        <div class="flex flex-col gap-1 col-span-2">
+                            <label class="text-sm text-surface-400 flex items-center gap-1">
+                                <i class="pi pi-tag text-xs" /> Extras / Misceláneos
+                            </label>
+                            <InputNumber v-model="form.gasto_misc" :min="0" :minFractionDigits="2" :maxFractionDigits="2"
+                                class="w-full" placeholder="Anillas, llaveros, embalaje..." />
+                            <small class="text-surface-400">Importe directo añadido al precio final (sin markup)</small>
                         </div>
                     </div>
                 </Panel>
 
-                <!-- Actions -->
-                <div class="flex flex-wrap gap-2">
-                    <Button label="Ticket Cliente" icon="pi pi-file" severity="secondary" outlined @click="getTicket('cliente')" />
-                    <Button label="Ticket Empresa" icon="pi pi-briefcase" severity="secondary" outlined @click="getTicket('empresa')" />
-                    <Button label="Exportar Ambos PDFs" icon="pi pi-file-pdf" severity="help" @click="exportBothPdfs" />
-                    <Button label="Recalcular" icon="pi pi-refresh" severity="warning" outlined @click="calculate" />
-                    <Button label="Guardar Pedido" icon="pi pi-save" severity="success" @click="saveOrder" class="ml-auto" />
-                </div>
-
-                <!-- Charts -->
-                <div class="grid grid-cols-1 xl:grid-cols-2 gap-4">
-                    <ChartCard title="Distribución de Costes" type="pie" :data="chartDataDonut" :options="pieOpts" height="360px" />
-                    <ChartCard title="Desglose por Concepto" type="bar" :data="chartDataBar" :options="barOpts" height="360px" />
-                </div>
+                <Button label="Calcular Presupuesto" icon="pi pi-bolt" @click="calculate" class="w-full" severity="info" size="large" />
             </div>
 
-            <!-- Empty State -->
-            <div v-else class="flex flex-col items-center justify-center h-full text-surface-400 gap-4 py-20">
-                <i class="pi pi-calculator text-6xl text-surface-300" />
-                <p class="text-lg">Configura los parámetros y calcula un presupuesto</p>
+            <!-- RIGHT: Results -->
+            <div class="flex-1 min-w-0">
+                <div v-if="result" class="flex flex-col gap-4">
+                    <!-- Summary Cards -->
+                    <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+                        <div class="flex flex-col gap-2">
+                            <div class="bg-primary-50 dark:bg-primary-950/30 border border-primary-200 dark:border-primary-800 rounded-xl p-4 text-center flex-1 flex flex-col justify-center">
+                                <div class="text-xs text-primary-600 dark:text-primary-400 font-semibold uppercase tracking-wide">Precio Total</div>
+                                <div class="text-2xl font-bold text-primary-700 dark:text-primary-300 mt-1">{{ summaryMetrics.precioFinal.toFixed(2) }} {{ unit }}</div>
+                                <div v-if="summaryMetrics.cantidad > 1" class="text-xs text-primary-500 mt-1">{{ summaryMetrics.cantidad }} ud. × {{ summaryMetrics.precioUnitario.toFixed(2) }} {{ unit }}/ud.</div>
+                            </div>
+                            
+                            <div class="bg-orange-50 dark:bg-orange-900/20 border border-orange-200 dark:border-orange-800 rounded-xl p-3 text-center">
+                                <div class="text-[10px] text-orange-600 dark:text-orange-400 font-semibold uppercase tracking-wide">Coste por Error</div>
+                                <div class="text-lg font-bold text-orange-700 dark:text-orange-300">{{ formatMoney(summaryMetrics.costeBruto / Math.max(1, summaryMetrics.cantidad)) }}</div>
+                                <div class="text-[10px] text-orange-500 mt-1 leading-tight">Coste bruto por pieza. Cada reimpresión fallida resta este importe del beneficio neto.</div>
+                            </div>
+                        </div>
+                        <div class="bg-green-50 dark:bg-green-950/30 border border-green-200 dark:border-green-800 rounded-xl p-4 text-center">
+                            <div class="text-xs text-green-600 dark:text-green-400 font-semibold uppercase tracking-wide">Beneficio</div>
+                            <div class="text-2xl font-bold text-green-700 dark:text-green-300 mt-1">{{ summaryMetrics.beneficioNeto.toFixed(2) }} {{ unit }}</div>
+                        </div>
+                        <div class="card-inset rounded-xl p-4 text-center">
+                            <div class="text-xs text-surface-500 font-semibold uppercase tracking-wide">Coste Bruto</div>
+                            <div class="text-2xl font-bold mt-1">{{ summaryMetrics.costeBruto.toFixed(2) }} {{ unit }}</div>
+                        </div>
+                    </div>
+
+                    <!-- Shared Split Info -->
+                    <div v-if="result.info.is_shared && result.info.shared_split" class="p-4 border border-indigo-200 dark:border-indigo-800 bg-indigo-50 dark:bg-indigo-950/30 rounded-xl">
+                        <div class="flex items-center gap-2 mb-3">
+                            <i class="pi pi-users text-indigo-500" />
+                            <span class="font-semibold text-indigo-600 dark:text-indigo-400">Pedido Compartido — Reparto</span>
+                        </div>
+                        <div class="grid grid-cols-2 gap-4">
+                            <div class="text-center p-3 bg-blue-50 dark:bg-blue-950/30 rounded-lg border border-blue-200 dark:border-blue-800">
+                                <div class="text-xs font-semibold text-blue-500 uppercase">3DCC ({{ result.info.shared_split['3DCC'] }}%)</div>
+                                <div class="text-xl font-bold text-blue-600 dark:text-blue-400 mt-1">{{ (result.info.precio_final * result.info.shared_split['3DCC'] / 100).toFixed(2) }} {{ unit }}</div>
+                            </div>
+                            <div class="text-center p-3 bg-purple-50 dark:bg-purple-950/30 rounded-lg border border-purple-200 dark:border-purple-800">
+                                <div class="text-xs font-semibold text-purple-500 uppercase">SILAB3D ({{ result.info.shared_split['SILAB3D'] }}%)</div>
+                                <div class="text-xl font-bold text-purple-600 dark:text-purple-400 mt-1">{{ (result.info.precio_final * result.info.shared_split['SILAB3D'] / 100).toFixed(2) }} {{ unit }}</div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Breakdown -->
+                    <Panel header="Desglose de Costes" :pt="{ root: { class: 'card rounded-2xl border-0 overflow-hidden' }, header: { class: '!bg-transparent border-b border-black/[0.05] dark:border-white/[0.06] px-4 py-3' }, content: { class: '!bg-transparent p-4' } }">
+                        <div class="flex flex-col gap-3">
+                            <!-- Sección 1: Bruto -->
+                            <div class="rounded-xl card-inset">
+                                <div class="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-surface-500 border-b border-black/[0.04] dark:border-white/[0.06]">
+                                    Bruto <span class="font-normal normal-case">(filamento + electricidad)</span>
+                                </div>
+                                <div class="px-3 py-1">
+                                    <div v-for="row in detailedBreakdown?.brutoRows || []" :key="`bruto-${row.label}`"
+                                        class="flex justify-between items-center py-2 border-b border-black/[0.04] dark:border-white/[0.06] last:border-0">
+                                        <span class="text-surface-600 dark:text-surface-300">{{ row.label }}</span>
+                                        <span class="font-mono font-semibold text-primary-600 dark:text-primary-400">{{ formatMoney(row.value) }}</span>
+                                    </div>
+                                    <div class="flex justify-between items-center py-2">
+                                        <span class="font-semibold text-surface-700 dark:text-surface-200">Subtotal bruto</span>
+                                        <span class="font-mono font-bold text-primary-600 dark:text-primary-400">{{ formatMoney(detailedBreakdown?.brutoTotal || 0) }}</span>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <!-- Sección 2: Complementos -->
+                            <div class="rounded-xl card-inset">
+                                <div class="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-surface-500 border-b border-black/[0.04] dark:border-white/[0.06]">
+                                    Complementos <span class="font-normal normal-case">(mano de obra + extras)</span>
+                                </div>
+                                <div class="px-3 py-1">
+                                    <div v-for="row in detailedBreakdown?.complementosRows || []" :key="`comp-${row.label}`"
+                                        class="flex justify-between items-center py-2 border-b border-black/[0.04] dark:border-white/[0.06] last:border-0">
+                                        <span class="text-surface-600 dark:text-surface-300">{{ row.label }}</span>
+                                        <span class="font-mono font-semibold text-primary-600 dark:text-primary-400">{{ formatMoney(row.value) }}</span>
+                                    </div>
+                                    <div class="flex justify-between items-center py-2">
+                                        <span class="font-semibold text-surface-700 dark:text-surface-200">Subtotal complementos</span>
+                                        <span class="font-mono font-bold text-primary-600 dark:text-primary-400">{{ formatMoney(detailedBreakdown?.complementosTotal || 0) }}</span>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <!-- Sección 3: Beneficio -->
+                            <div class="rounded-xl card-inset">
+                                <div class="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-surface-500 border-b border-black/[0.04] dark:border-white/[0.06]">
+                                    Beneficio <span class="font-normal normal-case">(markup + error)</span>
+                                </div>
+                                <div class="px-3 py-1">
+                                    <div class="flex justify-between items-center py-2 border-b border-black/[0.04] dark:border-white/[0.06]">
+                                        <span class="text-surface-600 dark:text-surface-300">Suplemento markup (×{{ (detailedBreakdown?.markup || 2.3).toFixed(2) }})</span>
+                                        <span class="font-mono font-semibold text-green-600 dark:text-green-400">+{{ formatMoney(detailedBreakdown?.markupSupplement || 0) }}</span>
+                                    </div>
+                                    <div class="flex justify-between items-center py-2 border-b border-black/[0.04] dark:border-white/[0.06]">
+                                        <span class="text-surface-600 dark:text-surface-300">
+                                            Suplemento error ({{ detailedBreakdown?.tasaErrorLabel }}{{ errorRepString }})
+                                        </span>
+                                        <span class="font-mono font-semibold text-amber-500">+{{ formatMoney(detailedBreakdown?.errorSupplement || 0) }}</span>
+                                    </div>
+                                    <div v-if="(detailedBreakdown?.recargoUrgencia || 0) > 0" class="flex justify-between items-center py-2 border-b border-black/[0.04] dark:border-white/[0.06]">
+                                        <span class="text-surface-600 dark:text-surface-300">Recargo urgencia</span>
+                                        <span class="font-mono font-semibold text-orange-500">+{{ formatMoney(detailedBreakdown?.recargoUrgencia || 0) }}</span>
+                                    </div>
+                                    <div class="flex justify-between items-center py-2">
+                                        <span class="font-semibold text-surface-700 dark:text-surface-200">Subtotal beneficio</span>
+                                        <span class="font-mono font-bold text-green-600 dark:text-green-400">{{ formatMoney(detailedBreakdown?.beneficioTotal || 0) }}</span>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </Panel>
+
+                    <!-- Actions -->
+                    <div class="flex flex-wrap gap-2">
+                        <Button label="Ticket Cliente" icon="pi pi-file" severity="secondary" outlined @click="getTicket('cliente')" />
+                        <Button label="Ticket Empresa" icon="pi pi-briefcase" severity="secondary" outlined @click="getTicket('empresa')" />
+                        <Button label="Exportar Ambos PDFs" icon="pi pi-file-pdf" severity="help" @click="exportBothPdfs" />
+                        <Button label="Recalcular" icon="pi pi-refresh" severity="warning" outlined @click="calculate" />
+                        <Button label="Guardar Pedido" icon="pi pi-save" severity="success" @click="saveOrder" class="ml-auto" />
+                    </div>
+
+                    <!-- Charts -->
+                    <div class="grid grid-cols-1 xl:grid-cols-2 gap-4">
+                        <ChartCard title="Distribución de Costes" type="pie" :data="chartDataDonut" :options="pieOpts" height="360px" />
+                        <ChartCard title="Desglose por Concepto" type="bar" :data="chartDataBar" :options="barOpts" height="360px" />
+                    </div>
+                </div>
+
+                <!-- Empty State -->
+                <div v-else class="flex flex-col items-center justify-center h-full text-surface-400 gap-4 py-20">
+                    <i class="pi pi-calculator text-6xl text-surface-300" />
+                    <p class="text-lg">Configura los parámetros y calcula un presupuesto</p>
+                </div>
             </div>
         </div>
-    </div>
-    </div>
 
-    <!-- Ticket Dialog -->
-    <Dialog v-model:visible="ticketDialogVisible" modal :header="ticketTitle" :style="{ width: 'min(95vw, 45rem)' }">
-        <Textarea v-model="ticketContent" rows="18" class="w-full font-mono text-sm" readonly autoResize />
-        <template #footer>
-            <Button label="Copiar" icon="pi pi-copy" severity="secondary" text @click="copyTicket" />
-            <Button label="Guardar PDF" icon="pi pi-file-pdf" severity="help" @click="pdfTicket" />
-        </template>
-    </Dialog>
+        <!-- Risk Assessment Dialog -->
+        <Dialog v-model:visible="riskDialog" modal header="Cuestionario de Riesgo" :style="{ width: '32rem' }">
+            <div class="flex flex-col gap-4 py-2">
+                <p class="text-sm text-surface-500 mb-2">Responde estas 4 preguntas para que el sistema calcule la probabilidad de fallo recomendada.</p>
+                
+                <div class="flex flex-col gap-1">
+                    <label class="text-sm font-semibold">1. Geometría y Estabilidad</label>
+                    <Select v-model="indiceError.estabilidad" :options="OPTIONS.estabilidad" optionLabel="label" optionValue="value" class="w-full" />
+                </div>
+                
+                <div class="flex flex-col gap-1">
+                    <label class="text-sm font-semibold">2. Dificultad Técnica del Material</label>
+                    <Select v-model="indiceError.material" :options="OPTIONS.materialDificultad" optionLabel="label" optionValue="value" class="w-full" />
+                </div>
 
-    <EmailNotifyDialog
-        v-model:visible="emailConfirmState.visible"
-        :order="emailConfirmState.order"
-        :old-status="emailConfirmState.oldStatus"
-        :new-status="emailConfirmState.newStatus"
-        :recipient-email="emailConfirmState.recipientEmail"
-        :title="emailConfirmState.title"
-        @update:recipient-email="(v) => emailConfirmState.recipientEmail = v"
-        @confirm="onEmailDialogSend"
-        @skip="onEmailDialogSkip"
-        @cancel="onEmailDialogCancel"
-    />
+                <div class="flex flex-col gap-1">
+                    <label class="text-sm font-semibold">3. Multicolor o Monocolor</label>
+                    <Select v-model="indiceError.multicolor" :options="OPTIONS.esMulticolor" optionLabel="label" optionValue="value" class="w-full" />
+                </div>
+                
+                <div class="flex flex-col gap-1">
+                    <label class="text-sm font-semibold">4. Estado del Modelo / I+D</label>
+                    <Select v-model="indiceError.puesta" :options="OPTIONS.puestaAPunto" optionLabel="label" optionValue="value" class="w-full" />
+                </div>
+
+                <div class="flex items-center justify-between p-4 rounded-2xl mt-2 bg-surface-100 dark:bg-surface-800/50 border border-black/[0.05] dark:border-white/[0.05]">
+                    <div>
+                        <div class="text-[10px] uppercase font-bold text-surface-500 tracking-wider">Probabilidad Sugerida</div>
+                        <div class="text-xl font-black text-primary-600 dark:text-primary-400">
+                            {{ indiceErrorSugerido }}
+                        </div>
+                    </div>
+                    <Button label="Aplicar" icon="pi pi-check" @click="applyIndiceError" />
+                </div>
+            </div>
+        </Dialog>
+
+        <!-- Ticket Dialog -->
+        <Dialog v-model:visible="ticketDialogVisible" modal :header="ticketTitle" :style="{ width: 'min(95vw, 45rem)' }">
+            <div class="flex flex-col gap-3">
+                <Textarea v-model="ticketContent" rows="18" class="w-full font-mono text-sm" readonly autoResize />
+            </div>
+            <template #footer>
+                <Button label="Copiar" icon="pi pi-copy" severity="secondary" text @click="copyTicket" />
+                <Button label="Guardar PDF" icon="pi pi-file-pdf" severity="help" @click="pdfTicket" />
+            </template>
+        </Dialog>
+
+        <EmailNotifyDialog
+            v-model:visible="emailConfirmState.visible"
+            :order="emailConfirmState.order"
+            :old-status="emailConfirmState.oldStatus"
+            :new-status="emailConfirmState.newStatus"
+            :recipient-email="emailConfirmState.recipientEmail"
+            :title="emailConfirmState.title"
+            @update:recipient-email="(v) => emailConfirmState.recipientEmail = v"
+            @confirm="onEmailDialogSend"
+            @skip="onEmailDialogSkip"
+            @cancel="onEmailDialogCancel"
+        />
+    </div>
 </template>

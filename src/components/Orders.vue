@@ -64,12 +64,26 @@ const archivedCount = computed(() => orders.value.filter(o => o.archived).length
 const enviados = computed(() => orders.value.filter(o => ['Presupuesto enviado', 'Enviado'].includes(o.estado) && !o.archived).length)
 const aceptados = computed(() => orders.value.filter(o => ['Aceptado', 'En producción', 'Post-procesado', 'Listo para entregar', 'Entregado'].includes(o.estado)).length)
 
-const parseFechaTsRobust = (f) => {
-    if (!f) return 0
-    if (/^\d{4}-\d{2}-\d{2}$/.test(f)) return new Date(f + 'T12:00:00').getTime()
-    const p = f.split('/')
-    if (p.length === 3) return new Date(p[2], p[1] - 1, p[0]).getTime()
-    return 0
+const parseFechaTsRobust = (o) => {
+    if (!o.fecha) return 0
+    let baseTs = 0
+    if (/^\d{4}-\d{2}-\d{2}$/.test(o.fecha)) {
+        baseTs = new Date(o.fecha + 'T00:00:00').getTime()
+    } else {
+        const p = o.fecha.split('/')
+        if (p.length === 3) baseTs = new Date(p[2], p[1] - 1, p[0]).getTime()
+    }
+
+    if (o.created_at) {
+        const d = new Date(o.created_at)
+        if (!isNaN(d.getTime())) {
+            // Add the time part of created_at to the base date timestamp to ensure 
+            // orders from the same day are sorted by creation time.
+            const timePart = (d.getHours() * 3600000) + (d.getMinutes() * 60000) + (d.getSeconds() * 1000) + d.getMilliseconds()
+            return baseTs + timePart
+        }
+    }
+    return baseTs
 }
 const fmtFecha = (v) => {
     if (!v) return '-'
@@ -84,7 +98,7 @@ const ordersForTable = computed(() =>
         .filter(o => !pendingDelete.order || o.id !== pendingDelete.order.id)
         .filter(o => showArchived.value ? !!o.archived : !o.archived)
         .filter(o => !filterStatus.value || paymentStatus(o) === filterStatus.value)
-        .map(o => ({ ...o, _fecha_ts: parseFechaTsRobust(o.fecha) }))
+        .map(o => ({ ...o, _fecha_ts: parseFechaTsRobust(o) }))
 )
 
 const toggleShowArchived = () => {
@@ -119,7 +133,7 @@ const paymentBarColor = (o) => {
 }
 const daysPending = (o) => {
     if (o.estado !== 'Aceptado' || paymentPct(o) >= 100) return null
-    const ts = parseFechaTsRobust(o.fecha)
+    const ts = parseFechaTsRobust(o)
     if (!ts) return null
     return Math.floor((Date.now() - ts) / (1000 * 60 * 60 * 24))
 }
@@ -139,14 +153,11 @@ const detailFechaDate = computed({
 
 /* ── Client autocomplete ── */
 const clientSuggestions = ref([])
-const knownClients = computed(() =>
-    [...new Set(store.appData.orders.map(o => o.cliente).filter(Boolean))].sort()
-)
+const clients = computed(() => store.appData.clients || [])
 const filterClients = (e) => {
     const q = (e.query || '').toLowerCase()
-    clientSuggestions.value = q
-        ? knownClients.value.filter(c => c.toLowerCase().includes(q))
-        : [...knownClients.value]
+    const all = clients.value.map(c => c.name)
+    clientSuggestions.value = q ? all.filter(c => c.toLowerCase().includes(q)) : all
 }
 
 /* ── Copy helpers ── */
@@ -199,11 +210,82 @@ const detail = reactive({
     imagen_path: '',
 })
 
+const buildOrderPayload = (order) => ({
+    empresa: order.empresa || store.empresa,
+    cliente: order.cliente || '',
+    cliente_email: order.cliente_email || '',
+    fecha: order.fecha || '',
+    descripcion: order.descripcion || '',
+    impresora: order.impresora || '',
+    filamento_tipo: order.filamento || '',
+    filamento_color: order.filamento_color || '',
+    peso_g: Number(order.peso_g) || 0,
+    tiempo_h: Number(order.horas) || 1,
+    cantidad: Number(order.cantidad) || 1,
+    is_multimaterial: !!order.is_multimaterial,
+    material_breakdown: Array.isArray(order.material_breakdown) ? order.material_breakdown.map(l => ({ ...l })) : [],
+    is_shared: !!order.is_shared,
+    shared_percent_3dcc: order.shared_split?.['3DCC'] ?? 50,
+    shared_percent_silab3d: order.shared_split?.['SILAB3D'] ?? 50,
+    gasto_misc: Number(order.gasto_misc || 0),
+    diseno_modelado: order.diseno_modelado || 'No necesario',
+    busqueda_modelos: order.busqueda_modelos || 'No',
+    eliminacion_soportes: order.eliminacion_soportes || 'No',
+    postprocesado: order.postprocesado_label || 'No',
+    probabilidad_error: order.probabilidad_error_label || 'Baja',
+    markup: order.markup_label || 'Normal (230%)',
+    urgencia_nivel: order.urgencia_nivel || 'Normal',
+    deterioro_impresora: 'Autofinanciación',
+})
+
 const imageDataUrl = ref('')
 const imageLoading = ref(false)
+const orderBreakdownObj = ref(null)
 
-watch(selectedOrder, (order) => {
-    if (!order) return
+watch(selectedOrder, async (order) => {
+    if (!order) {
+        orderBreakdownObj.value = null
+        return
+    }
+    
+    // Asynchronously calculate breakdown for display
+    try {
+        const payload = buildOrderPayload(order)
+        const calcRes = await api.calculate(payload)
+        const info = calcRes.info || {}
+        const rawBreakdown = calcRes.breakdownDict || {}
+        const allRows = Object.entries(rawBreakdown).map(([label, value]) => ({
+            label,
+            value: Number(value || 0)
+        }))
+
+        const isBrutoRaw = (label) => label === 'Filamento' || label === 'Electricidad' || label === 'Deterioro imp.'
+        const brutoRows = allRows.filter((row) => isBrutoRaw(row.label))
+        const brutoTotal = brutoRows.reduce((acc, row) => acc + row.value, 0)
+
+        const isComplemento = (label) => !isBrutoRaw(label)
+        const complementosRows = allRows.filter((row) => isComplemento(row.label))
+        const complementosTotal = complementosRows.reduce((acc, row) => acc + row.value, 0)
+
+        const costeBrutoFormula = Number(info.coste_bruto_impresion || 0)
+        const markup = Number(info.markup || 2.3)
+        const errorRate = Number(info.error_rate || 0)
+        const markupSupplement = Math.max(0, costeBrutoFormula * (markup - 1))
+        const errorSupplement = Math.max(0, costeBrutoFormula * errorRate)
+        const recargoUrgencia = Number(info.recargo_urgencia || 0)
+        const beneficioTotal = markupSupplement + errorSupplement + recargoUrgencia
+
+        orderBreakdownObj.value = {
+            brutoRows, brutoTotal, complementosRows, complementosTotal,
+            markupSupplement, errorSupplement, recargoUrgencia,
+            gastoMisc: Number(info.gasto_misc || 0), beneficioTotal,
+            markup, errorRate, tasaErrorLabel: info.prob_error || order.probabilidad_error_label || 'Baja',
+            cantidad: Number(order.cantidad) || 1
+        }
+    } catch {
+        orderBreakdownObj.value = null
+    }
+
     detail.fecha = order.fecha || ''
     detail.cliente = order.cliente || ''
     detail.cliente_email = order.cliente_email || ''
@@ -324,7 +406,7 @@ const markSent = async () => {
 }
 
 const quickChangeStatus = async (order, newStatus) => {
-    if (order.estado === newStatus || order._fromPartner) return
+    if (order.estado === newStatus) return
     
     try {
         const decision = await _maybeAskEmailFor(order, newStatus, 'Notificar cambio de estado')
@@ -363,7 +445,7 @@ const quickChangeStatus = async (order, newStatus) => {
 }
 
 const advanceStatusFast = async () => {
-    if (!selectedOrder.value || isPartnerOrder.value) return
+    if (!selectedOrder.value) return
     const idx = ORDER_STATUS.indexOf(selectedOrder.value.estado)
     if (idx === -1 || idx >= ORDER_STATUS.length - 1) {
         toast.add({ severity: 'info', summary: 'Estado final', detail: 'El pedido ya está en el último estado.', life: 2000 })
@@ -374,7 +456,7 @@ const advanceStatusFast = async () => {
 }
 
 const deleteOrder = () => {
-    if (!selectedOrder.value || isPartnerOrder.value) return
+    if (!selectedOrder.value) return
     const order = { ...selectedOrder.value }
     closeDetail()
 
@@ -412,7 +494,7 @@ const duplicateOrder = async () => {
 }
 
 const toggleArchive = async () => {
-    if (!selectedOrder.value || isPartnerOrder.value) return
+    if (!selectedOrder.value) return
     const newArchived = !selectedOrder.value.archived
     try {
         await store.updateOrder({ orderId: selectedOrder.value.id, updates: { archived: newArchived } })
@@ -541,6 +623,34 @@ const generateLink = async () => {
     }
 }
 
+const markAsLoss = () => {
+    if (!selectedOrder.value) return
+    const debt = Number(selectedOrder.value.precio_final || 0) - Number(selectedOrder.value.importe_pagado || 0)
+    confirmDlg.require({
+        message: `¿Dar por perdido el cobro pendiente de ${fmt(debt)} y archivar el pedido? Esta acción moverá el pedido a Archivados y lo quitará de las cuentas pendientes.`,
+        header: 'Cerrar con pérdida',
+        icon: 'pi pi-exclamation-circle',
+        rejectLabel: 'Cancelar',
+        acceptLabel: 'Confirmar pérdida',
+        acceptProps: { severity: 'danger' },
+        accept: async () => {
+            try {
+                await store.updateOrder({
+                    orderId: selectedOrder.value.id,
+                    updates: {
+                        archived: true,
+                        notes: (selectedOrder.value.notes ? selectedOrder.value.notes + '\n' : '') + `[PÉRDIDA: ${fmt(debt)} el ${new Date().toLocaleDateString()}]`
+                    }
+                })
+                closeDetail()
+                toast.add({ severity: 'warn', summary: 'Pedido cerrado con pérdida', detail: 'Se ha movido a archivados', life: 4000 })
+            } catch (e) {
+                toast.add({ severity: 'error', summary: 'Error', detail: e.message, life: 3500 })
+            }
+        }
+    })
+}
+
 const saveOrderEdits = async () => {
     if (!selectedOrder.value) return
     try {
@@ -609,34 +719,6 @@ const saveOrderEdits = async () => {
 }
 
 /* ── Tickets from order ──────────────────────────────────────────────── */
-
-const buildOrderPayload = (order) => ({
-    empresa: order.empresa || store.empresa,
-    cliente: order.cliente || '',
-    cliente_email: order.cliente_email || '',
-    fecha: order.fecha || '',
-    descripcion: order.descripcion || '',
-    impresora: order.impresora || '',
-    filamento_tipo: order.filamento || '',
-    filamento_color: order.filamento_color || '',
-    peso_g: Number(order.peso_g) || 0,
-    tiempo_h: Number(order.horas) || 1,
-    cantidad: Number(order.cantidad) || 1,
-    is_multimaterial: !!order.is_multimaterial,
-    material_breakdown: Array.isArray(order.material_breakdown) ? order.material_breakdown.map(l => ({ ...l })) : [],
-    is_shared: !!order.is_shared,
-    shared_percent_3dcc: order.shared_split?.['3DCC'] ?? 50,
-    shared_percent_silab3d: order.shared_split?.['SILAB3D'] ?? 50,
-    gasto_misc: Number(order.gasto_misc || 0),
-    diseno_modelado: order.diseno_modelado || 'No necesario',
-    busqueda_modelos: order.busqueda_modelos || 'No',
-    eliminacion_soportes: order.eliminacion_soportes || 'No',
-    postprocesado: order.postprocesado_label || 'No',
-    probabilidad_error: order.probabilidad_error_label || 'Baja',
-    markup: order.markup_label || 'Normal (230%)',
-    urgencia_nivel: order.urgencia_nivel || 'Normal',
-    deterioro_impresora: 'Autofinanciación',
-})
 
 const generateOrderTicket = async (type) => {
     if (!selectedOrder.value) return
@@ -1320,6 +1402,78 @@ const saveModify = async () => {
                         </div>
                     </div>
 
+                    <!-- Cost Breakdown -->
+                    <div v-if="orderBreakdownObj" class="rounded-xl card-inset p-4">
+                        <div class="text-[10px] font-semibold uppercase tracking-wider text-surface-500 mb-3 flex justify-between items-center">
+                            <span>Desglose de Costes</span>
+                            <span class="text-primary-500 font-bold">~{{ fmt(orderBreakdownObj.beneficioTotal) }} de margen neto</span>
+                        </div>
+                        
+                        <!-- Bruto -->
+                        <div class="mb-4">
+                            <div class="text-[10px] uppercase font-bold text-surface-400 mb-1 border-b border-surface-100 dark:border-surface-800 pb-1">Bruto</div>
+                            <div class="flex flex-col gap-1 text-xs">
+                                <div v-for="item in orderBreakdownObj.brutoRows" :key="item.label" class="flex justify-between items-center text-surface-600 dark:text-surface-300">
+                                    <span>{{ item.label }}</span>
+                                    <span class="font-medium">{{ fmt(item.value) }}</span>
+                                </div>
+                                <div class="flex justify-between items-center text-surface-900 dark:text-surface-100 font-semibold mt-1">
+                                    <span>Subtotal Bruto</span>
+                                    <span>{{ fmt(orderBreakdownObj.brutoTotal) }}</span>
+                                </div>
+                            </div>
+                        </div>
+                        
+                        <!-- MO + Extras -->
+                        <div class="mb-4">
+                            <div class="text-[10px] uppercase font-bold text-surface-400 mb-1 border-b border-surface-100 dark:border-surface-800 pb-1">Mano de obra + extras</div>
+                            <div class="flex flex-col gap-1 text-xs">
+                                <div v-for="item in orderBreakdownObj.complementosRows" :key="item.label" class="flex justify-between items-center text-surface-600 dark:text-surface-300">
+                                    <span>{{ item.label }}</span>
+                                    <span class="font-medium">{{ fmt(item.value) }}</span>
+                                </div>
+                                <div class="flex justify-between items-center text-surface-900 dark:text-surface-100 font-semibold mt-1">
+                                    <span>Subtotal MO+Ex</span>
+                                    <span>{{ fmt(orderBreakdownObj.complementosTotal) }}</span>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Beneficio / Markup -->
+                        <div>
+                            <div class="text-[10px] uppercase font-bold text-surface-400 mb-1 border-b border-surface-100 dark:border-surface-800 pb-1">Margen + Error</div>
+                            <div class="flex flex-col gap-1 text-xs text-surface-600 dark:text-surface-300">
+                                <div class="flex justify-between items-center">
+                                    <span>Beneficio (x{{ orderBreakdownObj.markup }})</span>
+                                    <span class="font-medium text-green-600 dark:text-green-400">+{{ fmt(orderBreakdownObj.markupSupplement) }}</span>
+                                </div>
+                                <div v-if="orderBreakdownObj.errorRate > 0" class="flex justify-between items-center">
+                                    <span>Margen de Error ({{ orderBreakdownObj.tasaErrorLabel }})</span>
+                                    <span class="font-medium text-orange-600 dark:text-orange-400">+{{ fmt(orderBreakdownObj.errorSupplement) }}</span>
+                                </div>
+                                <div v-if="orderBreakdownObj.recargoUrgencia > 0" class="flex justify-between items-center">
+                                    <span>Recargo Urgencia</span>
+                                    <span class="font-medium text-purple-600 dark:text-purple-400">+{{ fmt(orderBreakdownObj.recargoUrgencia) }}</span>
+                                </div>
+                                
+                                <div class="w-full h-px bg-surface-100 dark:bg-surface-800 my-1"></div>
+                                <div class="flex justify-between items-center p-2 bg-surface-100 dark:bg-surface-800 rounded">
+                                    <span class="font-semibold text-surface-900 dark:text-surface-100">Beneficio Neto Calculado</span>
+                                    <span class="font-bold text-lg text-primary-500">{{ fmt(orderBreakdownObj.beneficioTotal) }}</span>
+                                </div>
+
+                                <div v-if="detail.repeticiones_error > 0" class="flex justify-between items-center mt-2 text-red-500 bg-red-50 dark:bg-red-900/20 p-2 rounded-t">
+                                    <span>Costo piezas fallidas ({{ detail.repeticiones_error }} ud.)</span>
+                                    <span class="font-bold">-{{ fmt((orderBreakdownObj.brutoTotal / orderBreakdownObj.cantidad) * detail.repeticiones_error) }}</span>
+                                </div>
+                                <div v-if="detail.repeticiones_error > 0" class="flex justify-between items-center bg-green-100 dark:bg-green-900/30 p-2 rounded-b border-t border-green-200 dark:border-green-800">
+                                    <span class="font-bold text-surface-900 dark:text-surface-100">Beneficio REAL final</span>
+                                    <span class="font-bold text-xl text-green-600 dark:text-green-400">{{ fmt(orderBreakdownObj.beneficioTotal - ((orderBreakdownObj.brutoTotal / orderBreakdownObj.cantidad) * detail.repeticiones_error)) }}</span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
                     <!-- Payment history -->
                     <div class="rounded-xl card-inset overflow-hidden">
                         <div class="px-3 py-2 text-[10px] font-semibold uppercase tracking-wider text-surface-500 border-b border-black/[0.04] dark:border-white/[0.06] flex items-center justify-between">
@@ -1422,12 +1576,22 @@ const saveModify = async () => {
 
         <template #footer>
             <div class="flex items-center justify-between w-full">
-                <Button
-                    :label="selectedOrder?.archived ? 'Recuperar' : 'Archivar'"
-                    :icon="selectedOrder?.archived ? 'pi pi-arrow-up-right-and-arrow-down-left-from-center' : 'pi pi-inbox'"
-                    severity="secondary" text size="small"
-                    @click="toggleArchive" :disabled="isPartnerOrder"
-                />
+                <div class="flex items-center gap-1">
+                    <Button
+                        :label="selectedOrder?.archived ? 'Recuperar' : 'Archivar'"
+                        :icon="selectedOrder?.archived ? 'pi pi-arrow-up-right-and-arrow-down-left-from-center' : 'pi pi-inbox'"
+                        severity="secondary" text size="small"
+                        @click="toggleArchive" :disabled="isPartnerOrder"
+                    />
+                    <Button
+                        v-if="!selectedOrder?.archived && (Number(selectedOrder?.precio_final || 0) - Number(selectedOrder?.importe_pagado || 0)) > 0.01"
+                        label="Cerrar con pérdida"
+                        icon="pi pi-exclamation-circle"
+                        severity="danger" text size="small"
+                        @click="markAsLoss" :disabled="isPartnerOrder"
+                        v-tooltip.top="'Archivar el pedido asumiendo que no se cobrará lo pendiente'"
+                    />
+                </div>
                 <div class="flex items-center gap-2">
                     <Button label="Cerrar" severity="secondary" text size="small" @click="closeDetail" />
                     <Button label="Guardar cambios" icon="pi pi-save" severity="info" size="small" @click="saveOrderEdits" :disabled="isPartnerOrder" />

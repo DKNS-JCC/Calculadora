@@ -87,7 +87,94 @@ export const store = reactive({
     }
 
     this.isLoaded = true
+
+    // CRM Migration: If clients list is empty, populate from history
+    if ((!this.appData.clients || this.appData.clients.length === 0) && this.appData.orders.length > 0) {
+      await this._migrateClientsFromOrders()
+    }
+
     await this._migrateOrdersIfNeeded()
+  },
+
+  async _migrateClientsFromOrders() {
+    console.log('[CRM] Migrating clients from historical orders...')
+    const clientMap = new Map()
+    // Process orders from oldest to newest to capture the most recent email/details
+    const sortedOrders = [...this.appData.orders].sort((a, b) => 
+      (a.created_at || a.fecha || '').localeCompare(b.created_at || b.fecha || '')
+    )
+
+    for (const order of sortedOrders) {
+      const name = String(order.cliente || '').trim()
+      if (!name) continue
+      
+      const email = String(order.cliente_email || '').trim()
+      const existing = clientMap.get(name)
+      
+      if (!existing) {
+        clientMap.set(name, {
+          id: `cl_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`,
+          name,
+          email,
+          phone: '',
+          tax_id: '',
+          address: '',
+          default_discount: 0,
+          notes: 'Migrado automáticamente del historial.'
+        })
+      } else if (email && !existing.email) {
+        existing.email = email
+      }
+    }
+
+    if (clientMap.size > 0) {
+      this.appData.clients = Array.from(clientMap.values())
+      await fsService.saveClients(this.empresa, this.appData.clients)
+      console.log(`[CRM] Migrated ${clientMap.size} clients.`)
+    }
+  },
+
+  async _ensureClientExists(order) {
+    if (!order.cliente) return
+    const name = String(order.cliente).trim()
+    if (!this.appData.clients) this.appData.clients = []
+    
+    const existing = this.appData.clients.find(c => c.name.toLowerCase() === name.toLowerCase())
+    if (!existing) {
+      await this.addClient({
+        name,
+        email: order.cliente_email || '',
+        phone: '',
+        tax_id: '',
+        address: '',
+        default_discount: 0,
+        notes: `Creado automáticamente desde el pedido #${order.id}`
+      })
+    } else if (order.cliente_email && !existing.email) {
+      // Update email if the order has one but the CRM entry doesn't
+      await this.updateClient({ clientId: existing.id, updates: { email: order.cliente_email } })
+    }
+  },
+
+  async addClient(client) {
+    const newClient = { ...client, id: client.id || `cl_${Date.now()}` }
+    if (!this.appData.clients) this.appData.clients = []
+    this.appData.clients.push(newClient)
+    await fsService.saveClients(this.empresa, this.appData.clients)
+    return newClient
+  },
+
+  async updateClient({ clientId, updates }) {
+    const idx = this.appData.clients.findIndex(c => c.id === clientId)
+    if (idx !== -1) {
+      this.appData.clients[idx] = { ...this.appData.clients[idx], ...updates }
+      await fsService.saveClients(this.empresa, this.appData.clients)
+    }
+  },
+
+  async removeClient(clientId) {
+    this.appData.clients = this.appData.clients.filter(c => c.id !== clientId)
+    await fsService.saveClients(this.empresa, this.appData.clients)
   },
 
   async _migrateOrdersIfNeeded() {
@@ -276,11 +363,28 @@ export const store = reactive({
 
   /* ── Order operations ───────────────────────────────────────────────────── */
 
+  _applyOrdersUpdate(newOrders) {
+    if (!this.appData) return
+    const partnerOrders = (this.appData.orders || []).filter(o => o._fromPartner)
+    this.appData.orders = [...newOrders, ...partnerOrders]
+  },
+
+  _getOrderEmpresaToSave(order) {
+    if (order && order._fromPartner && order._empresaOwner) {
+      return order._empresaOwner
+    }
+    return this.empresa
+  },
+
   async saveOrderFromResult(resultInfo, options = {}) {
     if (this.ghostMode) return
     const res = await api.saveOrderFromResult(JSON.parse(JSON.stringify(resultInfo)))
-    this.appData.orders = res.data.orders
-    await fsService.saveOrder(this.empresa, res.order)
+    this._applyOrdersUpdate(res.data.orders)
+    await fsService.saveOrder(this._getOrderEmpresaToSave(res.order), res.order)
+    
+    // CRM: Ensure client exists in database
+    await this._ensureClientExists(res.order)
+
     // Initial state: notify "Presupuesto enviado" if email exists
     if (!options.skipNotification) {
       this._notifyStatusChange(res.order, '', res.order.estado, options).catch(() => {})
@@ -299,9 +403,9 @@ export const store = reactive({
     }
 
     const res = await api.setOrderAccepted(orderId, partnerInv?.filament_stock || null)
-    this.appData.orders = res.data.orders
+    this._applyOrdersUpdate(res.data.orders)
     if (res.data.filament_stock) this.appData.filament_stock = res.data.filament_stock
-    const promises = [fsService.saveOrder(this.empresa, res.order)]
+    const promises = [fsService.saveOrder(this._getOrderEmpresaToSave(res.order), res.order)]
     // Material may have been consumed → save own inventory
     if (res.inventory) {
       promises.push(fsService.saveInventory(this.empresa, res.inventory))
@@ -322,8 +426,8 @@ export const store = reactive({
     const order = this.appData.orders.find(o => o.id === orderId)
     const oldStatus = order?.estado || ''
     const res = await api.setOrderSent(orderId)
-    this.appData.orders = res.data.orders
-    await fsService.saveOrder(this.empresa, res.order)
+    this._applyOrdersUpdate(res.data.orders)
+    await fsService.saveOrder(this._getOrderEmpresaToSave(res.order), res.order)
     if (!options.skipNotification) {
       this._notifyStatusChange(res.order, oldStatus, res.order.estado, options).catch(() => {})
     }
@@ -332,9 +436,10 @@ export const store = reactive({
 
   async removeOrder(orderId) {
     if (this.ghostMode) return
+    const order = this.appData.orders.find(o => o.id === orderId)
     const res = await api.deleteOrder(orderId)
-    this.appData.orders = res.data.orders
-    await fsService.removeOrder(this.empresa, orderId)
+    this._applyOrdersUpdate(res.data.orders)
+    await fsService.removeOrder(this._getOrderEmpresaToSave(order), orderId)
     return res
   },
 
@@ -343,8 +448,12 @@ export const store = reactive({
     const prev = this.appData.orders.find(o => o.id === params.orderId)
     const oldStatus = prev?.estado || ''
     const res = await api.updateOrder(structuredClone(params))
-    this.appData.orders = res.data.orders
-    await fsService.saveOrder(this.empresa, res.order)
+    this._applyOrdersUpdate(res.data.orders)
+    await fsService.saveOrder(this._getOrderEmpresaToSave(res.order), res.order)
+    
+    // CRM: Ensure client exists or email is updated
+    if (res.order) await this._ensureClientExists(res.order)
+
     if (res.order && oldStatus !== res.order.estado && !options.skipNotification) {
       this._notifyStatusChange(res.order, oldStatus, res.order.estado, options).catch(() => {})
     }
@@ -354,40 +463,40 @@ export const store = reactive({
   async recalculateOrder(params) {
     if (this.ghostMode) return
     const res = await api.recalculateOrder(structuredClone(params))
-    this.appData.orders = res.data.orders
-    await fsService.saveOrder(this.empresa, res.order)
+    this._applyOrdersUpdate(res.data.orders)
+    await fsService.saveOrder(this._getOrderEmpresaToSave(res.order), res.order)
     return res
   },
 
   async addManualPayment(params) {
     if (this.ghostMode) return
     const res = await api.addManualOrderPayment(structuredClone(params))
-    this.appData.orders = res.data.orders
-    await fsService.saveOrder(this.empresa, res.order)
+    this._applyOrdersUpdate(res.data.orders)
+    await fsService.saveOrder(this._getOrderEmpresaToSave(res.order), res.order)
     return res
   },
 
   async removePaymentRecord(params) {
     if (this.ghostMode) return
     const res = await api.removeOrderPaymentRecord(structuredClone(params))
-    this.appData.orders = res.data.orders
-    await fsService.saveOrder(this.empresa, res.order)
+    this._applyOrdersUpdate(res.data.orders)
+    await fsService.saveOrder(this._getOrderEmpresaToSave(res.order), res.order)
     return res
   },
 
   async generatePaymentLink(params) {
     if (this.ghostMode) return
     const res = await api.generateOrderPaymentLink(structuredClone(params))
-    this.appData.orders = res.data.orders
-    await fsService.saveOrder(this.empresa, res.order)
+    this._applyOrdersUpdate(res.data.orders)
+    await fsService.saveOrder(this._getOrderEmpresaToSave(res.order), res.order)
     return res
   },
 
   async duplicateOrder(orderId) {
     if (this.ghostMode) return
     const res = await api.duplicateOrder(orderId)
-    this.appData.orders = res.data.orders
-    await fsService.saveOrder(this.empresa, res.order)
+    this._applyOrdersUpdate(res.data.orders)
+    await fsService.saveOrder(this._getOrderEmpresaToSave(res.order), res.order)
     return res
   },
 

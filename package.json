@@ -1,6 +1,6 @@
 {
   "name": "3dcalc",
-  "version": "5.0.1",
+  "version": "6.0.0",
   "description": "Calculadora 3D para presupuestos de impresión 3D",
   "main": "electron-main/main.js",
   "author": {
@@ -74,8 +74,7 @@
       "node_modules/pdfkit/**/*",
       "node_modules/fontkit/**/*",
       "node_modules/linebreak/**/*",
-      "node_modules/nodemailer/**/*",
-      "logos/**/*"
+      "node_modules/nodemailer/**/*"
     ],
     "win": {
       "icon": "icon.ico",
@@ -86,10 +85,10 @@
     "nsis": {
       "installerIcon": "icon.ico",
       "uninstallerIcon": "icon.ico",
-      "oneClick": false,
+      "oneClick": true,
       "perMachine": false,
-      "allowToChangeInstallationDirectory": true,
-      "differentialPackage": true
+      "allowElevation": true,
+      "differentialPackage": false
     },
     "publish": [
       {

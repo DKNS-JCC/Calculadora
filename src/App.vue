@@ -15,9 +15,11 @@ import Toast from 'primevue/toast'
 import ConfirmDialog from 'primevue/confirmdialog'
 import Button from 'primevue/button'
 import Calculator from './components/Calculator.vue'
+import Dashboard from './components/Dashboard.vue'
 import Orders from './components/Orders.vue'
 import Inventory from './components/Inventory.vue'
 import Statistics from './components/Statistics.vue'
+import Clients from './components/Clients.vue'
 import Configuration from './components/Configuration.vue'
 import Login from './components/Login.vue'
 
@@ -106,6 +108,15 @@ const toggleDarkMode = () => {
     localStorage.setItem('darkMode', darkMode.value)
     document.documentElement.classList.toggle('dark', darkMode.value)
 }
+
+// Watch brand color and apply as CSS variable
+import { watch } from 'vue'
+watch(() => store.appData?.global_config?.brand_color, (newColor) => {
+    if (newColor) {
+        document.documentElement.style.setProperty('--p-primary-color', newColor)
+        // Also update the Tailwind primary if needed, but PrimeVue is priority
+    }
+}, { immediate: true })
 
 const pendingOrdersCount = computed(() => {
     if (!store.isLoaded) return 0
@@ -196,20 +207,26 @@ async function onLoginSuccess({ uid, email, empresa }) {
         <Tabs value="0" class="flex flex-col flex-1 overflow-hidden" :pt="{ root: { class: 'px-1' } }">
             <TabList class="shrink-0 backdrop-blur-xl bg-white/70 dark:bg-white/[0.04] border-b border-black/[0.06] dark:border-white/[0.07]">
                 <Tab value="0">
-                    <i class="pi pi-calculator mr-2" />Calculadora
+                    <i class="pi pi-home mr-2" />Dashboard
                 </Tab>
                 <Tab value="1">
+                    <i class="pi pi-calculator mr-2" />Calculadora
+                </Tab>
+                <Tab value="2">
                     <i class="pi pi-list mr-2" />Pedidos
                     <span v-if="pendingOrdersCount" class="ml-1.5 px-1.5 py-0.5 rounded-full text-[10px] font-bold bg-amber-500 text-white leading-none">{{ pendingOrdersCount }}</span>
                 </Tab>
-                <Tab value="2">
+                <Tab value="3">
                     <i class="pi pi-box mr-2" />Inventario
                     <span v-if="lowStockCount" class="ml-1.5 px-1.5 py-0.5 rounded-full text-[10px] font-bold bg-red-500 text-white leading-none">{{ lowStockCount }}</span>
                 </Tab>
-                <Tab value="3">
+                <Tab value="4">
                     <i class="pi pi-chart-bar mr-2" />Estadísticas
                 </Tab>
-                <Tab value="4">
+                <Tab value="5">
+                    <i class="pi pi-users mr-2" />Clientes
+                </Tab>
+                <Tab value="6">
                     <i class="pi pi-cog mr-2" />Configuración
                 </Tab>
                 <div class="ml-auto self-center flex items-center gap-1 mr-1">
@@ -223,11 +240,13 @@ async function onLoginSuccess({ uid, email, empresa }) {
                 </div>
             </TabList>
             <TabPanels class="flex-1 overflow-auto p-4">
-                <TabPanel value="0"><Calculator /></TabPanel>
-                <TabPanel value="1"><Orders /></TabPanel>
-                <TabPanel value="2"><Inventory /></TabPanel>
-                <TabPanel value="3"><Statistics /></TabPanel>
-                <TabPanel value="4"><Configuration /></TabPanel>
+                <TabPanel value="0"><Dashboard /></TabPanel>
+                <TabPanel value="1"><Calculator /></TabPanel>
+                <TabPanel value="2"><Orders /></TabPanel>
+                <TabPanel value="3"><Inventory /></TabPanel>
+                <TabPanel value="4"><Statistics /></TabPanel>
+                <TabPanel value="5"><Clients /></TabPanel>
+                <TabPanel value="6"><Configuration /></TabPanel>
             </TabPanels>
         </Tabs>
     </div>

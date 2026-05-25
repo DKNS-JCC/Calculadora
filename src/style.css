@@ -6,6 +6,11 @@
 
 @plugin "tailwindcss-primeui";
 
+/* ── PrimeVue / Tailwind Primary Variable ─────────────── */
+:root {
+  --p-primary-color: #3b82f6;
+}
+
 /* ── Align Tailwind dark: variant with PrimeVue's .dark class ── */
 @custom-variant dark (&:where(.dark, .dark *));
 
