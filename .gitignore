@@ -40,9 +40,6 @@ Thumbs.db
 .vscode/*
 !.vscode/extensions.json
 
-# Local Claude settings
-.claude/settings.local.json
-
 # Project-specific scratch
 old_info.json
 config.json
