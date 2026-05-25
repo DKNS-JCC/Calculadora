@@ -43,3 +43,6 @@ Thumbs.db
 # Project-specific scratch
 old_info.json
 config.json
+
+# Arduino sketches with embedded credentials
+*.ino
