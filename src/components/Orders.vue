@@ -2,13 +2,11 @@
 import { computed, reactive, ref, watch } from 'vue'
 import { store } from '../store'
 import { api } from '../platform'
-import { orderShare as _orderShare } from '../utils/orderShare'
 import DataTable from 'primevue/datatable'
 import Column from 'primevue/column'
 import Button from 'primevue/button'
 import Tag from 'primevue/tag'
 import Dialog from 'primevue/dialog'
-import ConfirmDialog from 'primevue/confirmdialog'
 import InputText from 'primevue/inputtext'
 import InputNumber from 'primevue/inputnumber'
 import Textarea from 'primevue/textarea'
@@ -17,14 +15,55 @@ import Slider from 'primevue/slider'
 import Checkbox from 'primevue/checkbox'
 import Divider from 'primevue/divider'
 import DatePicker from 'primevue/datepicker'
-import AutoComplete from 'primevue/autocomplete'
 import { useToast } from 'primevue/usetoast'
 import { useConfirm } from 'primevue/useconfirm'
 import OrderPurgeTable from './OrderPurgeTable.vue'
 import EmailNotifyDialog from './EmailNotifyDialog.vue'
+import WebQuotesInbox from './WebQuotesInbox.vue'
 import { useEmailConfirm } from '../composables/useEmailConfirm'
+import { useStaleOrders } from '../composables/useStaleOrders'
+import { laborOptions, DISENO_A_MEDIDA, MARKUP } from '../shared/backend.mjs'
+import { useIsHandheld } from '../composables/useMediaQuery'
 
 const selectedOrder = ref()
+
+/* Móvil y escritorio montan listas distintas, no la misma escondida con CSS. */
+const isHandheld = useIsHandheld()
+const cardLimit = ref(20)
+const ordersForCards = computed(() => ordersForTable.value.slice(0, cardLimit.value))
+
+/* Señales que en la tabla eran iconos sueltos de 12 px imposibles de acertar. */
+const mobileOrderActions = computed(() => {
+    const o = selectedOrder.value
+    const bloqueado = !o || isPartnerOrder.value
+    return [
+        { label: 'Avanzar', icon: 'pi pi-step-forward', disabled: bloqueado, run: advanceStatusFast },
+        { label: 'Modificar', icon: 'pi pi-pencil', disabled: bloqueado, run: openModifyDialog },
+        { label: 'Ticket', icon: 'pi pi-file', disabled: !o, run: () => generateOrderTicket('cliente') },
+        { label: 'Cobro', icon: 'pi pi-wallet', disabled: bloqueado, run: openLinkDialog },
+        { label: 'Duplicar', icon: 'pi pi-copy', disabled: bloqueado, run: duplicateOrder },
+        { label: o?.archived ? 'Recuperar' : 'Archivar', icon: o?.archived ? 'pi pi-arrow-up-right-and-arrow-down-left-from-center' : 'pi pi-inbox', disabled: bloqueado, run: toggleArchive },
+        { label: 'Copiar link', icon: 'pi pi-link', disabled: !o?.stripe_payment_url, run: copyGeneratedLink },
+        { label: 'Enviado', icon: 'pi pi-send', disabled: bloqueado, run: markSent },
+    ]
+})
+
+const cardBadges = (o) => {
+    const badges = []
+    const dias = daysPending(o)
+    if (dias !== null) badges.push({
+        text: `${dias} d pendiente`,
+        icon: 'pi pi-clock',
+        class: dias > 30
+            ? 'bg-red-500/10 text-red-500'
+            : dias > 14 ? 'bg-amber-500/10 text-amber-600 dark:text-amber-400' : 'bg-black/[0.05] dark:bg-white/[0.06] text-surface-500',
+    })
+    if (o.is_shared) badges.push({ text: 'Compartido', icon: 'pi pi-users', class: 'bg-indigo-500/10 text-indigo-500' })
+    if (o.quote_id) badges.push({ text: 'Web', icon: 'pi pi-globe', class: 'bg-sky-500/10 text-sky-500' })
+    if (o._fromPartner) badges.push({ text: o._empresaOwner, icon: 'pi pi-building', class: 'bg-black/[0.05] dark:bg-white/[0.06] text-surface-500' })
+    if (o.notes) badges.push({ text: 'Notas', icon: 'pi pi-comment', class: 'bg-black/[0.05] dark:bg-white/[0.06] text-surface-500' })
+    return badges
+}
 const detailDialogVisible = ref(false)
 const ticketDialogVisible = ref(false)
 const ticketTitle = ref('')
@@ -61,8 +100,9 @@ const beneficioReal = computed(() => {
 })
 const total = computed(() => orders.value.length)
 const archivedCount = computed(() => orders.value.filter(o => o.archived).length)
-const enviados = computed(() => orders.value.filter(o => ['Presupuesto enviado', 'Enviado'].includes(o.estado) && !o.archived).length)
-const aceptados = computed(() => orders.value.filter(o => ['Aceptado', 'En producción', 'Post-procesado', 'Listo para entregar', 'Entregado'].includes(o.estado)).length)
+const activosCount = computed(() => orders.value.filter(o => !o.archived).length)
+const pendientesCount = computed(() => orders.value.filter(o => !o.archived && ['Presupuesto enviado', 'Enviado'].includes(o.estado)).length)
+const enProduccionCount = computed(() => orders.value.filter(o => !o.archived && ['Aceptado', 'En producción', 'Post-procesado', 'Listo para entregar'].includes(o.estado)).length)
 
 const parseFechaTsRobust = (o) => {
     if (!o.fecha) return 0
@@ -138,6 +178,48 @@ const daysPending = (o) => {
     return Math.floor((Date.now() - ts) / (1000 * 60 * 60 * 24))
 }
 
+/* ── Avisos: pedidos sin actualización de estado en 7 días ── */
+const { staleOrders, staleDays, snoozeStale, rejectStale, finishStale } = useStaleOrders()
+
+const staleReject = (o) => {
+    confirmDlg.require({
+        message: `¿Marcar el pedido #${o.id} de ${o.cliente} como rechazado? Se archivará y dejará de generar avisos mientras esté archivado.`,
+        header: 'Pedido rechazado',
+        icon: 'pi pi-times-circle',
+        rejectLabel: 'Cancelar',
+        acceptLabel: 'Rechazar y archivar',
+        acceptProps: { severity: 'danger' },
+        accept: async () => {
+            try {
+                await rejectStale(o)
+                toast.add({ severity: 'warn', summary: 'Pedido rechazado', detail: `#${o.id} archivado`, life: 3000 })
+            } catch (e) {
+                toast.add({ severity: 'error', summary: 'Error', detail: e.message, life: 3500 })
+            }
+        },
+    })
+}
+
+const staleInProduction = async (o) => {
+    try {
+        await snoozeStale(o)
+        toast.add({ severity: 'info', summary: 'Aviso pospuesto', detail: `#${o.id}: si no hay cambios, volverá a avisar en 7 días`, life: 3200 })
+    } catch (e) {
+        toast.add({ severity: 'error', summary: 'Error', detail: e.message, life: 3500 })
+    }
+}
+
+const staleFinish = async (o) => {
+    try {
+        const decision = await _maybeAskEmailFor(o, 'Entregado', 'Notificar pedido entregado')
+        if (!decision.proceed) return
+        await finishStale(o, decision.options)
+        toast.add({ severity: 'success', summary: 'Pedido finalizado', detail: `#${o.id} entregado y archivado`, life: 3000 })
+    } catch (e) {
+        toast.add({ severity: 'error', summary: 'Error', detail: e.message, life: 3500 })
+    }
+}
+
 /* ── Detail DatePicker computed ── */
 const detailFechaDate = computed({
     get: () => {
@@ -150,15 +232,6 @@ const detailFechaDate = computed({
         detail.fecha = `${val.getFullYear()}-${String(val.getMonth() + 1).padStart(2, '0')}-${String(val.getDate()).padStart(2, '0')}`
     }
 })
-
-/* ── Client autocomplete ── */
-const clientSuggestions = ref([])
-const clients = computed(() => store.appData.clients || [])
-const filterClients = (e) => {
-    const q = (e.query || '').toLowerCase()
-    const all = clients.value.map(c => c.name)
-    clientSuggestions.value = q ? all.filter(c => c.toLowerCase().includes(q)) : all
-}
 
 /* ── Copy helpers ── */
 const copyOrderId = async () => {
@@ -177,22 +250,9 @@ const copyOrderIdFast = async (id) => {
     toast.add({ severity: 'info', summary: `ID #${id} copiado`, life: 1500 })
 }
 
-/** Returns the share multiplier (0–1) for the current empresa on a given order */
-const orderShare = (o) => _orderShare(o, store.empresa)
-
-const accepted = computed(() => orders.value.filter(o => ['Aceptado', 'En producción', 'Post-procesado', 'Listo para entregar', 'Entregado'].includes(o.estado)))
-const facturacion = computed(() => accepted.value.reduce((sum, o) => sum + Number(o.precio_final || 0) * orderShare(o), 0))
-const cobrado = computed(() => accepted.value.reduce((sum, o) => sum + Number(o.importe_pagado || 0) * orderShare(o), 0))
-const pendiente = computed(() => accepted.value.reduce((sum, o) => {
-    const diff = (Number(o.precio_final || 0) - Number(o.importe_pagado || 0)) * orderShare(o)
-    return sum + (diff > 0 ? diff : 0)
-}, 0))
-const propinas = computed(() => accepted.value.reduce((sum, o) => {
-    const diff = (Number(o.importe_pagado || 0) - Number(o.precio_final || 0)) * orderShare(o)
-    return sum + (diff > 0 ? diff : 0)
-}, 0))
 const unit = computed(() => store.appData.global_config.money_unit)
 const globalFilter = ref('')
+watch([globalFilter, () => showArchived.value, () => filterStatus.value], () => { cardLimit.value = 20 })
 
 const detail = reactive({
     fecha: '',
@@ -225,14 +285,14 @@ const buildOrderPayload = (order) => ({
     is_multimaterial: !!order.is_multimaterial,
     material_breakdown: Array.isArray(order.material_breakdown) ? order.material_breakdown.map(l => ({ ...l })) : [],
     is_shared: !!order.is_shared,
+    partner_printers: order.is_shared ? JSON.parse(JSON.stringify(store.partnerInventory?.printers || [])) : [],
     shared_percent_3dcc: order.shared_split?.['3DCC'] ?? 50,
     shared_percent_silab3d: order.shared_split?.['SILAB3D'] ?? 50,
     gasto_misc: Number(order.gasto_misc || 0),
     diseno_modelado: order.diseno_modelado || 'No necesario',
-    busqueda_modelos: order.busqueda_modelos || 'No',
-    eliminacion_soportes: order.eliminacion_soportes || 'No',
-    postprocesado: order.postprocesado_label || 'No',
-    probabilidad_error: order.probabilidad_error_label || 'Baja',
+    diseno_horas: Number(order.diseno_horas || 0),
+    postprocesado: order.postprocesado_label || 'Limpio',
+    probabilidad_error: normalizeProbLabel(order.probabilidad_error_label),
     markup: order.markup_label || 'Normal (230%)',
     urgencia_nivel: order.urgencia_nivel || 'Normal',
     deterioro_impresora: 'Autofinanciación',
@@ -250,6 +310,8 @@ watch(selectedOrder, async (order) => {
     
     // Asynchronously calculate breakdown for display
     try {
+        // Pedidos compartidos pueden usar una impresora del socio
+        if (order.is_shared && !store.partnerInventory) await store.loadPartnerInventory()
         const payload = buildOrderPayload(order)
         const calcRes = await api.calculate(payload)
         const info = calcRes.info || {}
@@ -276,6 +338,7 @@ watch(selectedOrder, async (order) => {
         const beneficioTotal = markupSupplement + errorSupplement + recargoUrgencia
 
         orderBreakdownObj.value = {
+            dict: rawBreakdown,
             brutoRows, brutoTotal, complementosRows, complementosTotal,
             markupSupplement, errorSupplement, recargoUrgencia,
             gastoMisc: Number(info.gasto_misc || 0), beneficioTotal,
@@ -311,6 +374,23 @@ watch(selectedOrder, async (order) => {
 })
 
 const fmt = (v) => Number(v).toFixed(2) + ' ' + unit.value
+const bdCost = (label) => Number(orderBreakdownObj.value?.dict?.[label] || 0)
+
+/* ── Historial unificado del pedido (cobros + ciclo de vida) ── */
+const orderHistory = computed(() => {
+    const o = selectedOrder.value
+    if (!o) return []
+    const ev = []
+    if (o.created_at || o.fecha) ev.push({ ts: o.created_at || o.fecha, icon: 'pi pi-plus-circle text-blue-400', label: 'Creado' })
+    const aceptadoOMas = ['Aceptado', 'En producción', 'Post-procesado', 'Listo para entregar', 'Entregado'].includes(o.estado)
+    if (o.accepted_at || aceptadoOMas) ev.push({ ts: o.accepted_at || '', icon: 'pi pi-check-circle text-green-400', label: 'Aceptado' })
+    for (const pago of (o.payment_history || [])) {
+        ev.push({ ts: pago.created_at, icon: 'pi pi-credit-card text-amber-400', label: pago.method || 'Cobro', amount: pago.amount, note: pago.note, payment: pago })
+    }
+    if (o.last_status_update) ev.push({ ts: o.last_status_update, icon: 'pi pi-sync text-indigo-400', label: `Estado: ${o.estado}` })
+    if (o.archived) ev.push({ ts: '', icon: 'pi pi-inbox text-surface-400', label: 'Archivado' })
+    return ev.sort((a, b) => String(a.ts).localeCompare(String(b.ts)))
+})
 const fmtDate = (v) => {
     if (!v) return '-'
     const d = new Date(v)
@@ -384,11 +464,8 @@ const markAccepted = async () => {
             toast.add({ severity: 'secondary', summary: 'Acción cancelada', life: 2200 })
             return
         }
-        const res = await store.acceptOrder(selectedOrder.value.id, decision.options)
+        await store.acceptOrder(selectedOrder.value.id, decision.options)
         selectedOrder.value = null
-        if (res.lowStock?.length) {
-            toast.add({ severity: 'warn', summary: 'Stock bajo', detail: res.lowStock.join(', '), life: 6000 })
-        }
     } catch (e) {
         toast.add({ severity: 'error', summary: 'Error', detail: e.message, life: 4000 })
     }
@@ -777,22 +854,31 @@ const exportBothOrderPdfs = async () => {
 
 /* ── Modify order (recalculate) ──────────────────────────────────────── */
 
+const editTarifas = computed(() => laborOptions(store.appData.global_config))
+const editLaborCostH = computed(() => Number(store.appData.global_config.labor_cost_h || 0))
+const editEsDisenoAMedida = computed(() => editForm.diseno_modelado === DISENO_A_MEDIDA)
+const editCantidadUds = computed(() => Math.max(1, Math.floor(Number(editForm.cantidad) || 1)))
+const editMarkupOptions = computed(() => Object.keys(MARKUP))
+
 const EDIT_OPTIONS = {
-    diseno: ['No necesario', 'Chorrada - En Slicer', "Fácil - Fusión 30'", "Medio - Fusión 60'", 'Avanzado - AI + Remesh'],
-    busqueda: ['No', 'Sí'],
-    soportes: ['No', 'Pocos / Baja dificultad', 'Muchos / Elevada dificultad'],
-    postproc: ['No', 'Sencillo (Lijado ligero)', 'Medio (Lijado + Ensamblado)', 'Complejo (Lijado + Pintura)'],
     probError: [
-        { label: 'Baja', value: 'Baja' },
-        { label: 'Media (≈ 1 fallo)', value: 'Media' },
-        { label: 'Alta (≈ 2 fallos)', value: 'Alta' },
+        { label: 'Baja (25%)', value: 'Baja (25%)' },
+        { label: 'Media (50%)', value: 'Media (50%)' },
+        { label: 'Alta (100% ≈ 1 fallo)', value: 'Alta (100%)' },
+        { label: 'Muy Alta (150%)', value: 'Muy Alta (150%)' },
+        { label: 'Crítica (200% ≈ 2 fallos)', value: 'Crítica (200%)' },
     ],
-    markup: ['Normal (230%)'],
     urgencia: ['Normal', 'Urgente'],
 }
 
-const PROB_ERROR_MAP = { 0.5: 'Baja', 1: 'Media', 2: 'Alta' }
+const PROB_ERROR_MAP = { 0.25: 'Baja (25%)', 0.5: 'Media (50%)', 1: 'Alta (100%)', 1.5: 'Muy Alta (150%)', 2: 'Crítica (200%)' }
 const MARKUP_MAP = { 2.3: 'Normal (230%)' }
+const PROB_LEVELS = ['Baja (25%)', 'Media (50%)', 'Alta (100%)', 'Muy Alta (150%)', 'Crítica (200%)']
+const PROB_LEGACY_MAP = { 'Exenta (0%)': 'Baja (25%)', 'Mínima (10%)': 'Baja (25%)', 'Baja': 'Baja (25%)', 'Media': 'Media (50%)', 'Alta': 'Alta (100%)', 'Muy Alta': 'Muy Alta (150%)', 'Crítica': 'Crítica (200%)' }
+const normalizeProbLabel = (label) => {
+    if (PROB_LEVELS.includes(label)) return label
+    return PROB_LEGACY_MAP[label] || 'Baja (25%)'
+}
 
 const modifyDialogVisible = ref(false)
 const modifyPreview = ref(null)
@@ -815,10 +901,9 @@ const editForm = reactive({
     shared_percent_silab3d: 50,
     gasto_misc: 0,
     diseno_modelado: 'No necesario',
-    busqueda_modelos: 'No',
-    eliminacion_soportes: 'No',
-    postprocesado: 'No',
-    probabilidad_error: 'Baja',
+    diseno_horas: 1,
+    postprocesado: 'Limpio',
+    probabilidad_error: 'Baja (25%)',
     markup: 'Normal (230%)',
     urgencia_nivel: 'Normal',
 })
@@ -843,7 +928,22 @@ const editMixTotalGrams = computed(() => editMixLines.reduce((acc, l) => acc + N
 const editMixTotalCost = computed(() => editMixLines.reduce((acc, l) => acc + editMixLineCost(l), 0))
 const editUnit = computed(() => store.appData.global_config.money_unit)
 
-const printerOptions = computed(() => store.appData.printers.map(p => p.name))
+const printerOptions = computed(() => {
+    const options = store.appData.printers.map(p => ({ label: p.name, value: p.name }))
+    // Impresoras compartidas: en pedidos compartidos se puede imprimir en las del socio
+    if (editForm.is_shared && store.partnerInventory?.printers?.length) {
+        const ownNames = new Set(store.appData.printers.map(p => p.name))
+        const partnerName = store.partnerInventory.partner || 'Socio'
+        for (const p of store.partnerInventory.printers) {
+            if (p?.name && !ownNames.has(p.name)) options.push({ label: `${p.name} · ${partnerName}`, value: p.name })
+        }
+    }
+    return options
+})
+
+watch(() => editForm.is_shared, (val) => {
+    if (val && !store.partnerInventory) store.loadPartnerInventory()
+})
 const filamentOptions = computed(() => store.appData.filament_types.map(f => f.name))
 
 const HEX_COLOR_MAP = {
@@ -885,6 +985,7 @@ watch(editMixLines, () => {
 const openModifyDialog = () => {
     if (!selectedOrder.value) return
     const o = selectedOrder.value
+    if (o.is_shared && !store.partnerInventory) store.loadPartnerInventory()
 
     // Populate form from order's stored parameters
     Object.assign(editForm, {
@@ -905,10 +1006,9 @@ const openModifyDialog = () => {
         gasto_misc: Number(o.gasto_misc || 0),
         // Restore labels from order (or fall back to reverse-mapped values)
         diseno_modelado: o.diseno_modelado || 'No necesario',
-        busqueda_modelos: o.busqueda_modelos || 'No',
-        eliminacion_soportes: o.eliminacion_soportes || 'No',
-        postprocesado: o.postprocesado_label || 'No',
-        probabilidad_error: o.probabilidad_error_label || PROB_ERROR_MAP[o.error_rate] || 'Baja',
+        diseno_horas: Number(o.diseno_horas) || 1,
+        postprocesado: o.postprocesado_label || 'Limpio',
+        probabilidad_error: normalizeProbLabel(o.probabilidad_error_label || PROB_ERROR_MAP[o.error_rate]),
         markup: o.markup_label || MARKUP_MAP[o.markup] || 'Normal (230%)',
         urgencia_nivel: o.urgencia_nivel || 'Normal',
     })
@@ -939,6 +1039,7 @@ const buildModifyPayload = () => {
         empresa: store.empresa,
         ...editForm,
         material_breakdown: mixBreakdown,
+        partner_printers: editForm.is_shared ? JSON.parse(JSON.stringify(store.partnerInventory?.printers || [])) : [],
         deterioro_impresora: 'Autofinanciación',
     }
 }
@@ -998,39 +1099,77 @@ const saveModify = async () => {
 
 <template>
     <div class="flex flex-col gap-4">
-        <!-- ═══ Stats ═══ -->
-        <div class="grid grid-cols-3 md:grid-cols-6 gap-2">
-            <div class="card rounded-2xl px-3 py-3">
-                <div class="text-[10px] text-surface-500 dark:text-white/40 font-medium uppercase tracking-widest">Pedidos</div>
-                <div class="text-2xl font-semibold mt-0.5 tracking-tight">{{ total }}</div>
-                <div class="text-[10px] text-surface-400 dark:text-white/30 mt-0.5">{{ aceptados }} acept. · {{ archivedCount }} arch.</div>
+        <!-- ═══ Bandeja de presupuestos web (solo 3DCC) ═══ -->
+        <WebQuotesInbox v-if="store.empresa === '3DCC' && !store.ghostMode" />
+
+        <!-- ═══ Avisos: pedidos sin actualizar ═══ -->
+        <div v-if="staleOrders.length" class="rounded-2xl border border-amber-300/60 dark:border-amber-700/50 bg-amber-50 dark:bg-amber-950/30 p-3 flex flex-col gap-2">
+            <div class="flex items-center gap-2 text-amber-700 dark:text-amber-300 text-sm font-semibold">
+                <i class="pi pi-bell" />
+                <span>{{ staleOrders.length }} pedido{{ staleOrders.length !== 1 ? 's' : '' }} sin actualizar desde hace más de 7 días</span>
             </div>
-            <div class="card rounded-2xl px-3 py-3">
-                <div class="text-[10px] text-purple-500 font-medium uppercase tracking-widest">Facturado</div>
-                <div class="text-2xl font-semibold text-purple-600 dark:text-purple-300 mt-0.5 tracking-tight">{{ facturacion.toFixed(0) }}<span class="text-base font-normal ml-0.5">{{ unit }}</span></div>
-                <div class="text-[10px] text-surface-400 dark:text-white/30 mt-0.5">Aceptados</div>
-            </div>
-            <div class="card rounded-2xl px-3 py-3">
-                <div class="text-[10px] text-emerald-500 font-medium uppercase tracking-widest">Cobrado</div>
-                <div class="text-2xl font-semibold text-emerald-600 dark:text-emerald-400 mt-0.5 tracking-tight">{{ cobrado.toFixed(0) }}<span class="text-base font-normal ml-0.5">{{ unit }}</span></div>
-            </div>
-            <div class="card rounded-2xl px-3 py-3">
-                <div class="text-[10px] text-amber-500 font-medium uppercase tracking-widest">Pendiente</div>
-                <div class="text-2xl font-semibold text-amber-600 dark:text-amber-400 mt-0.5 tracking-tight">{{ pendiente.toFixed(0) }}<span class="text-base font-normal ml-0.5">{{ unit }}</span></div>
-            </div>
-            <div class="card rounded-2xl px-3 py-3">
-                <div class="text-[10px] text-pink-500 font-medium uppercase tracking-widest">Propinas</div>
-                <div class="text-2xl font-semibold text-pink-600 dark:text-pink-400 mt-0.5 tracking-tight">{{ propinas.toFixed(0) }}<span class="text-base font-normal ml-0.5">{{ unit }}</span></div>
-            </div>
-            <div class="card rounded-2xl px-3 py-3">
-                <div class="text-[10px] text-blue-500 font-medium uppercase tracking-widest">Enviados</div>
-                <div class="text-2xl font-semibold text-blue-600 dark:text-blue-300 mt-0.5 tracking-tight">{{ enviados }}</div>
-                <div class="text-[10px] text-surface-400 dark:text-white/30 mt-0.5">Sin respuesta</div>
+            <div class="flex flex-col gap-1.5 max-h-44 overflow-auto">
+                <div v-for="o in staleOrders" :key="o.id" class="flex flex-wrap items-center gap-2 px-3 py-2 rounded-xl bg-white/70 dark:bg-black/20">
+                    <span class="font-mono text-xs text-surface-400">#{{ o.id }}</span>
+                    <span class="text-sm font-medium">{{ o.cliente }}</span>
+                    <span class="text-sm text-surface-500 truncate flex-1 min-w-[8rem]" :title="o.descripcion">{{ o.descripcion }}</span>
+                    <span class="text-[10px] text-amber-600 dark:text-amber-400 font-semibold whitespace-nowrap">{{ staleDays(o) }} días</span>
+                    <div class="flex gap-1.5 ml-auto">
+                        <Button label="Rechazado" size="small" severity="danger" outlined @click="staleReject(o)" v-tooltip.bottom="'Archiva el pedido y deja de avisar'" />
+                        <Button label="En producción" size="small" severity="info" outlined @click="staleInProduction(o)" v-tooltip.bottom="'Pospone este aviso 7 días'" />
+                        <Button label="Finalizado" size="small" severity="success" outlined @click="staleFinish(o)" v-tooltip.bottom="'Marca Entregado y archiva'" />
+                    </div>
+                </div>
             </div>
         </div>
 
-        <!-- ═══ Toolbar ═══ -->
-        <div class="flex flex-wrap items-center justify-between gap-2 p-1.5 rounded-2xl card">
+        <!-- ═══ Stats ═══ -->
+        <div class="grid grid-cols-2 md:grid-cols-4 gap-2">
+            <div class="card rounded-2xl px-3 py-3">
+                <div class="text-[10px] text-surface-500 dark:text-white/40 font-medium uppercase tracking-widest">Pedidos totales</div>
+                <div class="text-2xl font-semibold mt-0.5 tracking-tight">{{ total }}</div>
+                <div class="text-[10px] text-surface-400 dark:text-white/30 mt-0.5">{{ archivedCount }} archivados</div>
+            </div>
+            <div class="card rounded-2xl px-3 py-3">
+                <div class="text-[10px] text-blue-500 font-medium uppercase tracking-widest">Pedidos activos</div>
+                <div class="text-2xl font-semibold text-blue-600 dark:text-blue-300 mt-0.5 tracking-tight">{{ activosCount }}</div>
+                <div class="text-[10px] text-surface-400 dark:text-white/30 mt-0.5">No archivados</div>
+            </div>
+            <div class="card rounded-2xl px-3 py-3">
+                <div class="text-[10px] text-amber-500 font-medium uppercase tracking-widest">Pedidos pendientes</div>
+                <div class="text-2xl font-semibold text-amber-600 dark:text-amber-400 mt-0.5 tracking-tight">{{ pendientesCount }}</div>
+                <div class="text-[10px] text-surface-400 dark:text-white/30 mt-0.5">Aún sin aceptar</div>
+            </div>
+            <div class="card rounded-2xl px-3 py-3">
+                <div class="text-[10px] text-emerald-500 font-medium uppercase tracking-widest">En producción</div>
+                <div class="text-2xl font-semibold text-emerald-600 dark:text-emerald-400 mt-0.5 tracking-tight">{{ enProduccionCount }}</div>
+                <div class="text-[10px] text-surface-400 dark:text-white/30 mt-0.5">Aceptado → listo para entregar</div>
+            </div>
+        </div>
+
+        <!-- ═══ Barra móvil ═══
+             La barra de escritorio son 17 botones de icono de 32 px sin
+             etiqueta: en un móvil es un muro de círculos grises y los tooltips
+             no existen al tacto. Aquí solo buscador y archivados; las acciones
+             de cada pedido viven dentro de su ficha. -->
+        <div v-if="isHandheld" class="flex items-center gap-2">
+            <span class="relative flex-1">
+                <i class="pi pi-search absolute left-3 top-1/2 -translate-y-1/2 text-surface-400 text-sm pointer-events-none" aria-hidden="true" />
+                <InputText v-model="globalFilter" placeholder="Buscar pedido…" class="w-full !pl-9 !h-11" aria-label="Buscar pedido" />
+            </span>
+            <Button
+                :icon="showArchived ? 'pi pi-list' : 'pi pi-inbox'"
+                :severity="showArchived ? 'warn' : 'secondary'"
+                :aria-label="showArchived ? 'Ver pedidos activos' : 'Ver pedidos archivados'"
+                outlined class="!w-11 !h-11 shrink-0"
+                @click="toggleShowArchived"
+            />
+            <Button icon="pi pi-file-export" severity="secondary" outlined class="!w-11 !h-11 shrink-0"
+                aria-label="Exportar CSV" @click="exportCsv" />
+        </div>
+
+        <!-- ═══ Toolbar (escritorio) ═══ -->
+        <div v-if="!isHandheld" class="flex flex-wrap items-center justify-between gap-2 p-1.5 rounded-2xl card">
             <div class="flex flex-wrap gap-1.5">
                 <Button icon="pi pi-check" severity="success" size="small" rounded text v-tooltip.bottom="'Aceptar'" @click="markAccepted" :disabled="!selectedOrder || isPartnerOrder" />
                 <Button icon="pi pi-send" severity="warn" size="small" rounded text v-tooltip.bottom="'Enviado'" @click="markSent" :disabled="!selectedOrder || isPartnerOrder" />
@@ -1072,7 +1211,7 @@ const saveModify = async () => {
             <span class="text-xs font-semibold uppercase tracking-wider text-surface-400 mr-1">Cobro:</span>
             <button v-for="f in [null, 'Pendiente', 'Parcial', 'Pagado']" :key="String(f)"
                 @click="filterStatus = f; selectedOrder = null"
-                class="px-3 py-1 rounded-full text-xs font-medium transition-all cursor-pointer"
+                class="px-4 min-h-11 lg:min-h-0 lg:py-1 rounded-full text-xs font-medium transition-colors cursor-pointer"
                 :class="filterStatus === f
                     ? 'bg-black/80 dark:bg-white/90 text-white dark:text-black shadow-sm'
                     : 'bg-black/[0.05] dark:bg-white/[0.06] text-surface-600 dark:text-white/60 hover:bg-black/[0.08] dark:hover:bg-white/[0.10]'"
@@ -1080,8 +1219,73 @@ const saveModify = async () => {
             <span class="text-xs text-surface-400 dark:text-white/30 ml-auto">{{ ordersForTable.length }} pedido{{ ordersForTable.length !== 1 ? 's' : '' }}</span>
         </div>
 
-        <!-- ═══ Full-width DataTable ═══ -->
+        <!-- ═══ Lista de tarjetas (móvil) ═══
+             Sustituye a la tabla: 10 columnas en 390 px obligaban a hacer
+             scroll horizontal y a abrir con doble toque. Aquí la tarjeta
+             entera abre la ficha con un solo toque. -->
+        <div v-if="isHandheld" class="flex flex-col gap-2">
+            <button
+                v-for="o in ordersForCards"
+                :key="o.id"
+                type="button"
+                class="card rounded-2xl p-4 w-full text-left flex flex-col gap-3 transition-transform active:scale-[0.99]"
+                :class="o.archived ? 'opacity-60' : ''"
+                @click="openDetail({ data: o })"
+            >
+                <div class="flex items-start justify-between gap-3">
+                    <div class="min-w-0 flex-1">
+                        <div class="font-semibold truncate">{{ o.cliente || 'Sin cliente' }}</div>
+                        <div class="text-sm text-surface-500 dark:text-surface-400 truncate">{{ o.descripcion || '—' }}</div>
+                    </div>
+                    <Tag :value="o.estado" :severity="getSeverity(o.estado)" class="text-[10px] shrink-0 max-w-[7.5rem] truncate" />
+                </div>
+
+                <div class="flex items-end justify-between gap-3">
+                    <div class="min-w-0">
+                        <div class="text-xl font-semibold tracking-tight">{{ fmt(o.precio_final) }}</div>
+                        <div class="text-[11px] text-surface-400 dark:text-white/40">
+                            {{ paymentStatus(o) }}<template v-if="paymentPct(o) > 0 && paymentPct(o) < 100"> · {{ fmt(o.importe_pagado) }} cobrado</template>
+                        </div>
+                    </div>
+                    <div class="text-right shrink-0">
+                        <div class="text-[11px] text-surface-400 dark:text-white/40">{{ fmtFecha(o.fecha) }}</div>
+                        <div class="text-[11px] font-mono text-surface-400 dark:text-white/40">#{{ o.id }}</div>
+                    </div>
+                </div>
+
+                <div class="h-1.5 rounded-full bg-surface-200 dark:bg-surface-700 overflow-hidden">
+                    <div class="h-full rounded-full" :class="paymentBarColor(o)" :style="{ width: paymentPct(o) + '%' }" />
+                </div>
+
+                <div v-if="cardBadges(o).length" class="flex items-center gap-2 flex-wrap">
+                    <span v-for="b in cardBadges(o)" :key="b.text"
+                        class="inline-flex items-center gap-1 text-[10px] font-medium px-2 py-0.5 rounded-full"
+                        :class="b.class">
+                        <i :class="b.icon" class="text-[9px]" aria-hidden="true" />{{ b.text }}
+                    </span>
+                </div>
+            </button>
+
+            <Button v-if="ordersForCards.length < ordersForTable.length"
+                :label="`Ver más (${ordersForTable.length - ordersForCards.length} restantes)`"
+                severity="secondary" outlined class="!h-11" @click="cardLimit += 20" />
+
+            <div v-if="!ordersForTable.length" class="flex flex-col items-center justify-center py-14 gap-3 text-center">
+                <div class="w-16 h-16 rounded-full bg-surface-100 dark:bg-surface-800 flex items-center justify-center">
+                    <i class="pi pi-inbox text-3xl text-surface-400" aria-hidden="true" />
+                </div>
+                <p class="font-semibold text-surface-600 dark:text-surface-300">
+                    {{ showArchived ? 'No hay pedidos archivados' : 'No hay pedidos activos' }}
+                </p>
+                <p class="text-sm text-surface-400 px-8">
+                    {{ showArchived ? 'Los pedidos totalmente pagados aparecen aquí automáticamente' : 'Crea un presupuesto en la pestaña Calculadora para empezar' }}
+                </p>
+            </div>
+        </div>
+
+        <!-- ═══ Tabla (escritorio) ═══ -->
         <DataTable
+            v-if="!isHandheld"
             v-model:selection="selectedOrder"
             :value="ordersForTable"
             selectionMode="single"
@@ -1118,14 +1322,19 @@ const saveModify = async () => {
                     <Button v-if="!showArchived" label="Ir a Calculadora" icon="pi pi-calculator" size="small" text severity="info" />
                 </div>
             </template>
+            <Column field="id" header="Código" sortable style="width: 6rem">
+                <template #body="{ data }">
+                    <span class="font-mono text-xs cursor-pointer hover:text-blue-500 transition-colors" @click.stop="copyOrderIdFast(data.id)" v-tooltip.top="'Copiar código'">#{{ data.id }}</span>
+                </template>
+            </Column>
             <Column field="_fecha_ts" header="Fecha" sortable style="width: 7rem; max-width: 7rem">
                 <template #body="{ data }">
-                    <span class="cursor-pointer hover:text-blue-500 transition-colors" @click.stop="copyOrderIdFast(data.id)" v-tooltip.top="'Copiar ID'">{{ fmtFecha(data.fecha) }}</span>
+                    <span>{{ fmtFecha(data.fecha) }}</span>
                 </template>
             </Column>
             <Column field="cliente" header="Cliente" sortable style="min-width: 8rem; max-width: 12rem">
                 <template #body="{ data }">
-                    <span class="block truncate cursor-pointer hover:text-blue-500 transition-colors" :title="data.cliente" @click.stop="copyClientName(data.cliente)" v-tooltip.top="'Copiar cliente'">{{ data.cliente }}</span>
+                    <span class="block truncate" :title="data.cliente">{{ data.cliente }}</span>
                     <span v-if="daysPending(data) !== null" class="text-[9px] font-semibold"
                         :class="daysPending(data) > 30 ? 'text-red-400' : daysPending(data) > 14 ? 'text-amber-400' : 'text-surface-400'">
                         +{{ daysPending(data) }}d
@@ -1154,7 +1363,7 @@ const saveModify = async () => {
             </Column>
             <Column header="Cobro" style="width: 7rem">
                 <template #body="{ data }">
-                    <div class="flex flex-col gap-1">
+                    <div class="flex flex-col gap-1 min-w-0">
                         <div class="h-1.5 rounded-full bg-surface-200 dark:bg-surface-700 overflow-hidden">
                             <div class="h-full rounded-full transition-all" :class="paymentBarColor(data)" :style="{ width: paymentPct(data) + '%' }" />
                         </div>
@@ -1193,6 +1402,7 @@ const saveModify = async () => {
                     <div class="flex items-center gap-1">
                         <i v-if="data.is_shared" class="pi pi-users text-indigo-400 text-xs" v-tooltip.top="'Compartido'" />
                         <i v-if="data.notes" class="pi pi-comment text-surface-300 text-xs" v-tooltip.top="data.notes" />
+                        <Tag v-if="data.quote_id" value="WEB" severity="info" class="text-[9px] px-1.5 py-0" v-tooltip.top="data._webCodigo ? `Enlazado a ${data._webCodigo} — la web se actualiza sola` : 'Enlazado a presupuesto web'" />
                         <Tag v-if="data._fromPartner" :value="data._empresaOwner" severity="secondary" class="text-[9px] px-1.5 py-0" />
                         <Button
                             v-if="paymentPct(data) < 100 && !data._fromPartner && !data.archived"
@@ -1211,15 +1421,17 @@ const saveModify = async () => {
     <!-- ═══════════════════════════════════════════════════════════════════
          Detail Dialog — opens on row click
          ═══════════════════════════════════════════════════════════════════ -->
-    <Dialog v-model:visible="detailDialogVisible" modal :style="{ width: 'min(96vw, 52rem)' }" :closable="true"
-        @hide="selectedOrder = null" class="!p-0" :pt="{ root: { class: 'rounded-3xl overflow-hidden' }, content: { class: '!p-0' }, header: { class: 'rounded-t-3xl' }, footer: { class: 'rounded-b-3xl' } }">
+    <Dialog v-model:visible="detailDialogVisible" modal :closable="true"
+        :style="isHandheld ? { width: '100vw', maxWidth: '100vw', height: '100dvh', maxHeight: '100dvh', margin: '0' } : { width: 'min(96vw, 52rem)' }"
+        @hide="selectedOrder = null" class="!p-0"
+        :pt="{ root: { class: isHandheld ? 'overflow-hidden !rounded-none' : 'rounded-3xl overflow-hidden' }, content: { class: '!p-0' }, header: { class: isHandheld ? '' : 'rounded-t-3xl' }, footer: { class: isHandheld ? 'pb-[max(0.75rem,env(safe-area-inset-bottom))]' : 'rounded-b-3xl' } }">
         <template #header>
             <div v-if="selectedOrder" class="flex items-center gap-3 w-full">
                 <span class="font-bold text-lg">#{{ selectedOrder.id }}</span>
                 <Button icon="pi pi-copy" size="small" text rounded class="!w-5 !h-5 shrink-0" severity="secondary" @click="copyOrderId" v-tooltip.top="'Copiar ID'" />
                 <span class="text-surface-400">·</span>
                 <span class="font-medium truncate max-w-[12rem]">{{ selectedOrder.cliente }}</span>
-                <Button icon="pi pi-copy" size="small" text rounded class="!w-5 !h-5 shrink-0" severity="secondary" @click="copyClientName" v-tooltip.top="'Copiar cliente'" />
+                <Button icon="pi pi-copy" size="small" text rounded class="!w-5 !h-5 shrink-0" severity="secondary" @click="copyClientName(selectedOrder.cliente)" v-tooltip.top="'Copiar cliente'" />
                 <Tag :value="selectedOrder.estado" :severity="getSeverity(selectedOrder.estado)" class="ml-auto text-[10px]" />
                 <Tag :value="paymentStatus(selectedOrder)" :severity="paymentSeverity(paymentStatus(selectedOrder))" class="text-[10px]" />
                 <Tag v-if="selectedOrder.archived" value="Archivado" severity="secondary" class="text-[10px]" />
@@ -1234,65 +1446,54 @@ const saveModify = async () => {
                 <span class="text-amber-700 dark:text-amber-300">Pedido de <strong>{{ selectedOrder._empresaOwner }}</strong> — sólo lectura</span>
             </div>
 
-            <!-- ── Summary cards row ── -->
-            <div class="grid grid-cols-4 gap-0 border-b border-black/[0.04] dark:border-white/[0.06]">
-                <div class="px-4 py-3 text-center border-r border-black/[0.04] dark:border-white/[0.06]">
-                    <div class="text-[10px] text-surface-400 uppercase tracking-wider font-semibold">Total</div>
-                    <div class="text-lg font-bold mt-0.5">{{ fmt(selectedOrder.precio_final) }}</div>
-                </div>
-                <div class="px-4 py-3 text-center border-r border-black/[0.04] dark:border-white/[0.06]">
-                    <div class="text-[10px] text-green-500 uppercase tracking-wider font-semibold">Cobrado</div>
-                    <div class="text-lg font-bold text-green-600 dark:text-green-400 mt-0.5">{{ fmt(selectedOrder.importe_pagado) }}</div>
-                </div>
-                <div class="px-4 py-3 text-center border-r border-black/[0.04] dark:border-white/[0.06]">
-                    <div class="text-[10px] text-amber-500 uppercase tracking-wider font-semibold">Pendiente</div>
-                    <div class="text-lg font-bold text-amber-600 dark:text-amber-400 mt-0.5">{{ fmt(Math.max(0, selectedOrder.importe_pendiente ?? (selectedOrder.precio_final - selectedOrder.importe_pagado))) }}</div>
-                </div>
-                <div class="px-4 py-3 text-center border-r border-black/[0.04] dark:border-white/[0.06]">
-                    <div class="text-[10px] text-surface-400 uppercase tracking-wider font-semibold">Beneficio teórico</div>
-                    <div class="text-lg font-bold text-purple-600 dark:text-purple-400 mt-0.5">{{ fmt(selectedOrder.beneficio_neto || 0) }}</div>
-                </div>
-                <div class="px-4 py-3 text-center">
-                    <div class="text-[10px] text-surface-400 uppercase tracking-wider font-semibold">Beneficio real</div>
-                    <div class="text-lg font-bold mt-0.5" :class="beneficioReal >= 0 ? 'text-purple-600 dark:text-purple-400' : 'text-red-500'">{{ fmt(beneficioReal) }}</div>
-                    <div v-if="(selectedOrder.repeticiones_error || 0) > 0" class="text-[9px] text-surface-400 mt-0.5">+{{ selectedOrder.repeticiones_error }} reimpresión(es)</div>
+            <!-- ── Precios del proyecto ── -->
+            <div class="border-b border-black/[0.04] dark:border-white/[0.06]">
+                <div class="px-4 pt-3 pb-1 text-[10px] font-semibold uppercase tracking-wider text-surface-500">Precios del proyecto</div>
+                <div class="grid grid-cols-3 md:grid-cols-6">
+                    <div class="px-3 py-3 text-center border-r border-black/[0.04] dark:border-white/[0.06]">
+                        <div class="text-[10px] text-surface-400 uppercase tracking-wider font-semibold">Precio total</div>
+                        <div class="text-lg font-bold mt-0.5">{{ fmt(selectedOrder.precio_final) }}</div>
+                        <div v-if="(selectedOrder.cantidad || 1) > 1" class="text-[9px] text-surface-400 mt-0.5">{{ selectedOrder.cantidad }} ud.</div>
+                    </div>
+                    <div class="px-3 py-3 text-center border-r border-black/[0.04] dark:border-white/[0.06]">
+                        <div class="text-[10px] text-orange-500 uppercase tracking-wider font-semibold">Coste bruto</div>
+                        <div class="text-lg font-bold text-orange-600 dark:text-orange-400 mt-0.5">{{ fmt(selectedOrder.coste_bruto || 0) }}</div>
+                    </div>
+                    <div class="px-3 py-3 text-center border-r border-black/[0.04] dark:border-white/[0.06]">
+                        <div class="text-[10px] text-purple-400 uppercase tracking-wider font-semibold">Beneficio teórico</div>
+                        <div class="text-lg font-bold text-purple-600 dark:text-purple-400 mt-0.5">{{ fmt(selectedOrder.beneficio_neto || 0) }}</div>
+                    </div>
+                    <div class="px-3 py-3 text-center border-r border-black/[0.04] dark:border-white/[0.06]">
+                        <div class="text-[10px] text-surface-400 uppercase tracking-wider font-semibold">Beneficio real</div>
+                        <div class="text-lg font-bold mt-0.5" :class="beneficioReal >= 0 ? 'text-purple-600 dark:text-purple-400' : 'text-red-500'">{{ fmt(beneficioReal) }}</div>
+                        <div v-if="(selectedOrder.repeticiones_error || 0) > 0" class="text-[9px] text-surface-400 mt-0.5">+{{ selectedOrder.repeticiones_error }} reimpresión(es)</div>
+                    </div>
+                    <div class="px-3 py-3 text-center border-r border-black/[0.04] dark:border-white/[0.06]">
+                        <div class="text-[10px] text-green-500 uppercase tracking-wider font-semibold">Cobrado</div>
+                        <div class="text-lg font-bold text-green-600 dark:text-green-400 mt-0.5">{{ fmt(selectedOrder.importe_pagado) }}</div>
+                    </div>
+                    <div class="px-3 py-3 text-center">
+                        <div class="text-[10px] text-amber-500 uppercase tracking-wider font-semibold">Pendiente</div>
+                        <div class="text-lg font-bold text-amber-600 dark:text-amber-400 mt-0.5">{{ fmt(Math.max(0, selectedOrder.importe_pendiente ?? (selectedOrder.precio_final - selectedOrder.importe_pagado))) }}</div>
+                    </div>
                 </div>
             </div>
 
             <!-- ── Main content 2-column ── -->
             <div class="grid grid-cols-1 lg:grid-cols-2 gap-5 p-5">
-                <!-- Left: Info + Edit fields -->
+                <!-- Left: Información del proyecto + Cobro -->
                 <div class="flex flex-col gap-4">
-                    <!-- Read-only info -->
+                    <!-- Información del proyecto -->
                     <div class="rounded-xl card-inset overflow-hidden">
                         <div class="px-3 py-2 text-[10px] font-semibold uppercase tracking-wider text-surface-500 border-b border-black/[0.04] dark:border-white/[0.06]">
-                            Información de impresión
+                            Información del proyecto
                         </div>
-                        <div class="grid grid-cols-2 text-sm">
-                            <div class="px-3 py-2 text-surface-500 border-b border-r border-black/[0.04] dark:border-white/[0.06]">Impresora</div>
-                            <div class="px-3 py-2 font-medium border-b border-black/[0.04] dark:border-white/[0.06]">{{ selectedOrder.impresora || '—' }}</div>
-                            <div class="px-3 py-2 text-surface-500 border-b border-r border-black/[0.04] dark:border-white/[0.06]">Material</div>
-                            <div class="px-3 py-2 font-medium border-b border-black/[0.04] dark:border-white/[0.06]">{{ selectedOrder.filamento || '—' }}</div>
-                            <div class="px-3 py-2 text-surface-500 border-b border-r border-black/[0.04] dark:border-white/[0.06]">Color</div>
-                            <div class="px-3 py-2 font-medium border-b border-black/[0.04] dark:border-white/[0.06]">{{ selectedOrder.filamento_color || '—' }}</div>
-                            <div class="px-3 py-2 text-surface-500 border-b border-r border-black/[0.04] dark:border-white/[0.06]">Peso / Tiempo</div>
-                            <div class="px-3 py-2 font-medium border-b border-black/[0.04] dark:border-white/[0.06]">{{ selectedOrder.peso_g || '—' }} g · {{ selectedOrder.horas || '—' }} h</div>
-                            <div class="px-3 py-2 text-surface-500 border-b border-r border-black/[0.04] dark:border-white/[0.06]">Cantidad</div>
-                            <div class="px-3 py-2 font-medium border-b border-black/[0.04] dark:border-white/[0.06]">{{ selectedOrder.cantidad || 1 }} ud.</div>
-                            <div class="px-3 py-2 text-surface-500 border-r border-black/[0.04] dark:border-white/[0.06]">Repeticiones (errores)</div>
-                            <div class="px-3 py-2">
-                                <InputNumber v-model="detail.repeticiones_error" :min="0" :step="1" class="w-24" size="small" :disabled="isPartnerOrder" inputClass="text-center" v-tooltip.top="'Nº de reimpresiones por fallo (para estadísticas reales)'" />
-                            </div>
-                        </div>
-                    </div>
-
-                    <!-- Editable fields -->
-                    <div class="grid grid-cols-2 gap-3">
-                        <div class="flex flex-col gap-1 col-span-2">
+                        <div class="p-3 grid grid-cols-1 sm:grid-cols-2 gap-3">
+                        <div class="flex flex-col gap-1 col-span-full min-w-0">
                             <label class="text-[10px] text-surface-500 uppercase tracking-wider font-semibold">Cliente</label>
-                            <AutoComplete v-model="detail.cliente" :suggestions="clientSuggestions" @complete="filterClients" dropdown dropdownMode="blank" class="w-full" size="small" />
+                            <InputText v-model="detail.cliente" class="w-full" size="small" autocomplete="off" />
                         </div>
-                        <div class="flex flex-col gap-1 col-span-2">
+                        <div class="flex flex-col gap-1 col-span-full min-w-0">
                             <label class="text-[10px] text-surface-500 uppercase tracking-wider font-semibold flex items-center gap-1.5">
                                 <i class="pi pi-envelope text-[10px]" />
                                 Email del cliente
@@ -1306,24 +1507,28 @@ const saveModify = async () => {
                                 <i class="pi pi-info-circle text-[10px] mr-1" />Recibirá un correo cuando cambies el estado del pedido.
                             </small>
                         </div>
-                        <div class="flex flex-col gap-1 col-span-2">
+                        <div class="flex flex-col gap-1 col-span-full min-w-0">
                             <label class="text-[10px] text-surface-500 uppercase tracking-wider font-semibold">Descripción</label>
                             <Textarea v-model="detail.descripcion" rows="2" autoResize class="w-full text-sm" />
                         </div>
-                        <div class="flex flex-col gap-1">
+                        <div class="flex flex-col gap-1 min-w-0">
                             <label class="text-[10px] text-surface-500 uppercase tracking-wider font-semibold">Fecha</label>
                             <DatePicker v-model="detailFechaDate" dateFormat="dd/mm/yy" showIcon iconDisplay="input" class="w-full" size="small" />
                         </div>
-                        <div class="flex flex-col gap-1">
+                        <div class="flex flex-col gap-1 min-w-0">
                             <label class="text-[10px] text-surface-500 uppercase tracking-wider font-semibold">Estado</label>
                             <Select v-model="detail.estado" :options="ORDER_STATUS" class="w-full" size="small" />
                         </div>
-                        <div class="flex flex-col gap-1 col-span-2">
+                        <div class="flex flex-col gap-1 col-span-full min-w-0">
+                            <label class="text-[10px] text-surface-500 uppercase tracking-wider font-semibold">Repeticiones por error</label>
+                            <InputNumber v-model="detail.repeticiones_error" :min="0" :step="1" class="w-32" size="small" :disabled="isPartnerOrder" inputClass="text-center" v-tooltip.top="'Nº de reimpresiones por fallo (para estadísticas reales)'" />
+                        </div>
+                        <div class="flex flex-col gap-1 col-span-full min-w-0">
                             <label class="text-[10px] text-surface-500 uppercase tracking-wider font-semibold">Notas internas</label>
                             <Textarea v-model="detail.notes" rows="2" autoResize class="w-full text-sm" />
                         </div>
                         <!-- Image attachment (Electron only) -->
-                        <div v-if="api?.openImageFilePicker" class="col-span-2 flex flex-col gap-2">
+                        <div v-if="api?.openImageFilePicker" class="col-span-full flex flex-col gap-2">
                             <label class="text-[10px] text-surface-500 uppercase tracking-wider font-semibold">Imagen de referencia</label>
                             <div v-if="imageDataUrl" class="relative rounded-xl overflow-hidden border border-black/[0.06] dark:border-white/[0.08]">
                                 <img :src="imageDataUrl" class="w-full max-h-48 object-contain bg-surface-50 dark:bg-surface-800" alt="Imagen del pedido" />
@@ -1336,20 +1541,18 @@ const saveModify = async () => {
                                 <span v-if="detail.imagen_path" class="text-[10px] text-surface-400 truncate">{{ detail.imagen_path }}</span>
                             </div>
                         </div>
+                        </div>
                     </div>
-                </div>
 
-                <!-- Right: Payment + Shared -->
-                <div class="flex flex-col gap-4">
                     <!-- Payment fields -->
                     <div class="rounded-xl card-inset p-4">
                         <div class="text-[10px] font-semibold uppercase tracking-wider text-surface-500 mb-3">Cobro</div>
-                        <div class="grid grid-cols-2 gap-3">
-                            <div class="flex flex-col gap-1">
+                        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                            <div class="flex flex-col gap-1 min-w-0">
                                 <label class="text-[10px] text-surface-500 uppercase tracking-wider font-semibold">Cobrado total</label>
                                 <InputNumber v-model="detail.importe_pagado" :min="0" :minFractionDigits="2" :maxFractionDigits="2" class="w-full" size="small" />
                             </div>
-                            <div class="flex flex-col gap-1">
+                            <div class="flex flex-col gap-1 min-w-0">
                                 <label class="text-[10px] text-surface-500 uppercase tracking-wider font-semibold">Método</label>
                                 <Select v-model="detail.payment_method" :options="PAYMENT_METHODS" class="w-full" size="small" />
                             </div>
@@ -1401,41 +1604,52 @@ const saveModify = async () => {
                             </div>
                         </div>
                     </div>
+                </div>
 
-                    <!-- Cost Breakdown -->
+                <!-- Right: Parámetros + Historial -->
+                <div class="flex flex-col gap-4">
+                    <!-- Parámetros y costes -->
                     <div v-if="orderBreakdownObj" class="rounded-xl card-inset p-4">
                         <div class="text-[10px] font-semibold uppercase tracking-wider text-surface-500 mb-3 flex justify-between items-center">
-                            <span>Desglose de Costes</span>
+                            <span>Parámetros del proyecto</span>
                             <span class="text-primary-500 font-bold">~{{ fmt(orderBreakdownObj.beneficioTotal) }} de margen neto</span>
                         </div>
-                        
-                        <!-- Bruto -->
+
+                        <!-- Parámetros básicos -->
                         <div class="mb-4">
-                            <div class="text-[10px] uppercase font-bold text-surface-400 mb-1 border-b border-surface-100 dark:border-surface-800 pb-1">Bruto</div>
-                            <div class="flex flex-col gap-1 text-xs">
-                                <div v-for="item in orderBreakdownObj.brutoRows" :key="item.label" class="flex justify-between items-center text-surface-600 dark:text-surface-300">
-                                    <span>{{ item.label }}</span>
-                                    <span class="font-medium">{{ fmt(item.value) }}</span>
-                                </div>
-                                <div class="flex justify-between items-center text-surface-900 dark:text-surface-100 font-semibold mt-1">
-                                    <span>Subtotal Bruto</span>
-                                    <span>{{ fmt(orderBreakdownObj.brutoTotal) }}</span>
-                                </div>
+                            <div class="text-[10px] uppercase font-bold text-surface-400 mb-1 border-b border-surface-100 dark:border-surface-800 pb-1">Parámetros básicos</div>
+                            <div class="grid grid-cols-[auto_1fr_auto] gap-x-3 gap-y-1 text-xs items-center">
+                                <span class="text-surface-400">Material</span>
+                                <span class="text-right text-surface-600 dark:text-surface-300 truncate">{{ selectedOrder.filamento || '—' }} ({{ selectedOrder.filamento_color || '—' }}) · {{ selectedOrder.peso_g }} g</span>
+                                <span class="font-medium text-right">{{ fmt(bdCost('Filamento')) }}</span>
+                                <span class="text-surface-400">Electricidad</span>
+                                <span class="text-right text-surface-600 dark:text-surface-300 truncate">{{ selectedOrder.horas }} h</span>
+                                <span class="font-medium text-right">{{ fmt(bdCost('Electricidad')) }}</span>
+                                <span class="text-surface-400">Impresora</span>
+                                <span class="text-right text-surface-600 dark:text-surface-300 truncate">{{ selectedOrder.impresora || '—' }}</span>
+                                <span class="font-medium text-right">{{ fmt(bdCost('Deterioro imp.')) }}</span>
+                                <span class="col-span-2 font-semibold text-surface-900 dark:text-surface-100 mt-1">Subtotal básicos</span>
+                                <span class="font-semibold text-right mt-1">{{ fmt(orderBreakdownObj.brutoTotal) }}</span>
                             </div>
                         </div>
-                        
-                        <!-- MO + Extras -->
+
+                        <!-- Parámetros complementarios -->
                         <div class="mb-4">
-                            <div class="text-[10px] uppercase font-bold text-surface-400 mb-1 border-b border-surface-100 dark:border-surface-800 pb-1">Mano de obra + extras</div>
-                            <div class="flex flex-col gap-1 text-xs">
-                                <div v-for="item in orderBreakdownObj.complementosRows" :key="item.label" class="flex justify-between items-center text-surface-600 dark:text-surface-300">
-                                    <span>{{ item.label }}</span>
-                                    <span class="font-medium">{{ fmt(item.value) }}</span>
-                                </div>
-                                <div class="flex justify-between items-center text-surface-900 dark:text-surface-100 font-semibold mt-1">
-                                    <span>Subtotal MO+Ex</span>
-                                    <span>{{ fmt(orderBreakdownObj.complementosTotal) }}</span>
-                                </div>
+                            <div class="text-[10px] uppercase font-bold text-surface-400 mb-1 border-b border-surface-100 dark:border-surface-800 pb-1">Parámetros complementarios</div>
+                            <div class="grid grid-cols-[auto_1fr_auto] gap-x-3 gap-y-1 text-xs items-center">
+                                <span class="text-surface-400">Diseño</span>
+                                <span class="text-right text-surface-600 dark:text-surface-300 truncate">{{ selectedOrder.diseno_modelado || 'No necesario' }}<template v-if="Number(selectedOrder.diseno_horas) > 0"> · {{ selectedOrder.diseno_horas }} h</template></span>
+                                <span class="font-medium text-right">{{ fmt(bdCost('Diseño')) }}</span>
+                                <span class="text-surface-400">Post-procesado</span>
+                                <span class="text-right text-surface-600 dark:text-surface-300 truncate">{{ selectedOrder.postprocesado_label || 'Limpio' }}<template v-if="Number(selectedOrder.cantidad) > 1"> × {{ selectedOrder.cantidad }} uds.</template></span>
+                                <span class="font-medium text-right">{{ fmt(bdCost('Post-procesado')) }}</span>
+                                <template v-if="bdCost('Extras / Misc.') > 0">
+                                    <span class="text-surface-400">Extras / Misc.</span>
+                                    <span class="text-right text-surface-600 dark:text-surface-300 truncate">—</span>
+                                    <span class="font-medium text-right">{{ fmt(bdCost('Extras / Misc.')) }}</span>
+                                </template>
+                                <span class="col-span-2 font-semibold text-surface-900 dark:text-surface-100 mt-1">Subtotal complementarios</span>
+                                <span class="font-semibold text-right mt-1">{{ fmt(orderBreakdownObj.complementosTotal) }}</span>
                             </div>
                         </div>
 
@@ -1474,65 +1688,30 @@ const saveModify = async () => {
                         </div>
                     </div>
 
-                    <!-- Payment history -->
+                    <!-- Historial del pedido (cobros + ciclo de vida) -->
                     <div class="rounded-xl card-inset overflow-hidden">
                         <div class="px-3 py-2 text-[10px] font-semibold uppercase tracking-wider text-surface-500 border-b border-black/[0.04] dark:border-white/[0.06] flex items-center justify-between">
-                            <span>Historial de cobros</span>
-                            <span class="text-surface-400">{{ selectedOrder.payment_history?.length || 0 }}</span>
+                            <span>Historial del pedido</span>
+                            <span class="text-surface-400">{{ orderHistory.length }}</span>
                         </div>
-                        <div v-if="!selectedOrder.payment_history?.length" class="px-3 py-4 text-sm text-surface-400 text-center">
-                            Sin movimientos
+                        <div v-if="!orderHistory.length" class="px-3 py-4 text-sm text-surface-400 text-center">
+                            Sin actividad
                         </div>
-                        <div v-else class="max-h-40 overflow-auto divide-y divide-black/[0.04] dark:divide-white/[0.06]">
-                            <div v-for="p in selectedOrder.payment_history" :key="p.id" class="px-3 py-2 flex items-start gap-2 text-sm hover:bg-surface-50 dark:hover:bg-surface-800/60">
+                        <div v-else class="max-h-56 overflow-auto divide-y divide-black/[0.04] dark:divide-white/[0.06]">
+                            <div v-for="(ev, i) in orderHistory" :key="i" class="px-3 py-2 flex items-start gap-2 text-sm hover:bg-surface-50 dark:hover:bg-surface-800/60">
+                                <i :class="ev.icon" class="text-sm shrink-0 mt-0.5" />
                                 <div class="flex-1 min-w-0">
                                     <div class="flex items-center justify-between">
-                                        <span class="font-medium text-xs">{{ p.method }}</span>
-                                        <span class="font-mono font-semibold text-xs" :class="Number(p.amount) >= 0 ? 'text-green-500' : 'text-red-500'">
-                                            {{ Number(p.amount) >= 0 ? '+' : '' }}{{ fmt(p.amount) }}
+                                        <span class="font-medium text-xs">{{ ev.label }}</span>
+                                        <span v-if="Number(ev.amount || 0) !== 0" class="font-mono font-semibold text-xs" :class="Number(ev.amount) >= 0 ? 'text-green-500' : 'text-red-500'">
+                                            {{ Number(ev.amount) >= 0 ? '+' : '' }}{{ fmt(ev.amount) }}
                                         </span>
                                     </div>
-                                    <div class="text-[10px] text-surface-400">{{ fmtDate(p.created_at) }}</div>
-                                    <div v-if="p.note" class="text-[10px] text-surface-400 truncate" :title="p.note">{{ p.note }}</div>
+                                    <div v-if="ev.ts" class="text-[10px] text-surface-400">{{ fmtDate(ev.ts) }}</div>
+                                    <div v-if="ev.note" class="text-[10px] text-surface-400 truncate" :title="ev.note">{{ ev.note }}</div>
                                 </div>
-                                <Button icon="pi pi-times" severity="danger" text size="small" rounded class="!w-6 !h-6 shrink-0"
-                                    @click="removePaymentRecord(p)" :disabled="isPartnerOrder" v-tooltip.left="'Eliminar'" />
-                            </div>
-                        </div>
-                    </div>
-
-                    <!-- Order lifecycle -->
-                    <div class="rounded-xl card-inset overflow-hidden">
-                        <div class="px-3 py-2 text-[10px] font-semibold uppercase tracking-wider text-surface-500 border-b border-black/[0.04] dark:border-white/[0.06]">
-                            Ciclo de vida
-                        </div>
-                        <div class="divide-y divide-black/[0.04] dark:divide-white/[0.06] text-xs">
-                            <div class="px-3 py-2 flex items-center gap-2">
-                                <i class="pi pi-plus-circle text-blue-400 text-sm shrink-0" />
-                                <div class="flex-1 min-w-0">
-                                    <span class="font-medium">Creado</span>
-                                    <span class="text-surface-400 ml-2">{{ fmtFecha(selectedOrder.fecha) }}</span>
-                                </div>
-                            </div>
-                            <div v-if="selectedOrder.estado === 'Aceptado' || selectedOrder.archived" class="px-3 py-2 flex items-center gap-2">
-                                <i class="pi pi-check-circle text-green-400 text-sm shrink-0" />
-                                <div class="flex-1 min-w-0">
-                                    <span class="font-medium">Aceptado</span>
-                                    <span v-if="selectedOrder.accepted_at" class="text-surface-400 ml-2">{{ fmtDate(selectedOrder.accepted_at) }}</span>
-                                </div>
-                            </div>
-                            <div v-if="selectedOrder.payment_history?.length" class="px-3 py-2 flex items-center gap-2">
-                                <i class="pi pi-credit-card text-amber-400 text-sm shrink-0" />
-                                <div class="flex-1 min-w-0">
-                                    <span class="font-medium">{{ selectedOrder.payment_history.length }} pago{{ selectedOrder.payment_history.length !== 1 ? 's' : '' }}</span>
-                                    <span class="text-surface-400 ml-2">{{ fmt(selectedOrder.importe_pagado) }} cobrado</span>
-                                </div>
-                            </div>
-                            <div v-if="selectedOrder.archived" class="px-3 py-2 flex items-center gap-2">
-                                <i class="pi pi-inbox text-surface-400 text-sm shrink-0" />
-                                <div class="flex-1 min-w-0">
-                                    <span class="font-medium">Archivado</span>
-                                </div>
+                                <Button v-if="ev.payment" icon="pi pi-times" severity="danger" text size="small" rounded class="!w-6 !h-6 shrink-0"
+                                    @click="removePaymentRecord(ev.payment)" :disabled="isPartnerOrder" v-tooltip.left="'Eliminar cobro'" />
                             </div>
                         </div>
                     </div>
@@ -1575,7 +1754,26 @@ const saveModify = async () => {
         </div>
 
         <template #footer>
-            <div class="flex items-center justify-between w-full">
+            <!-- Acciones en móvil: la barra de escritorio no se muestra, así que
+                 viven aquí, ancladas abajo (zona del pulgar) y con etiqueta.
+                 Eliminar se queda fuera a propósito: no se pone una acción
+                 destructiva pegada a las de uso diario. -->
+            <div v-if="isHandheld" class="flex flex-col gap-2 w-full">
+                <div class="grid grid-cols-4 gap-2">
+                    <button v-for="a in mobileOrderActions" :key="a.label" type="button"
+                        class="flex flex-col items-center justify-center gap-1 min-h-14 rounded-xl card-inset transition-transform active:scale-95 disabled:opacity-40"
+                        :disabled="a.disabled" @click="a.run()">
+                        <i :class="a.icon" class="text-base" :style="a.color ? { color: a.color } : null" aria-hidden="true" />
+                        <span class="text-[10px] font-medium leading-none">{{ a.label }}</span>
+                    </button>
+                </div>
+                <div class="flex items-center gap-2">
+                    <Button label="Cerrar" severity="secondary" outlined class="flex-1 !h-11" @click="closeDetail" />
+                    <Button label="Guardar" icon="pi pi-save" severity="info" class="flex-1 !h-11" @click="saveOrderEdits" :disabled="isPartnerOrder" />
+                </div>
+            </div>
+
+            <div v-else class="flex items-center justify-between w-full">
                 <div class="flex items-center gap-1">
                     <Button
                         :label="selectedOrder?.archived ? 'Recuperar' : 'Archivar'"
@@ -1630,16 +1828,16 @@ const saveModify = async () => {
                 <div class="flex flex-col gap-4">
                     <div class="p-3 card-inset rounded-xl">
                         <div class="text-xs font-semibold text-surface-500 uppercase tracking-wide mb-3">Proyecto</div>
-                        <div class="grid grid-cols-2 gap-3">
-                            <div class="flex flex-col gap-1">
+                        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                            <div class="flex flex-col gap-1 min-w-0">
                                 <label class="text-xs text-surface-400">Cliente</label>
                                 <InputText v-model="editForm.cliente" class="w-full" />
                             </div>
-                            <div class="flex flex-col gap-1">
+                            <div class="flex flex-col gap-1 min-w-0">
                                 <label class="text-xs text-surface-400">Fecha</label>
                                 <InputText v-model="editForm.fecha" class="w-full" />
                             </div>
-                            <div class="flex flex-col gap-1 col-span-2">
+                            <div class="flex flex-col gap-1 col-span-full min-w-0">
                                 <label class="text-xs text-surface-400">Descripción</label>
                                 <InputText v-model="editForm.descripcion" class="w-full" />
                             </div>
@@ -1648,16 +1846,16 @@ const saveModify = async () => {
 
                     <div class="p-3 card-inset rounded-xl">
                         <div class="text-xs font-semibold text-surface-500 uppercase tracking-wide mb-3">Impresión</div>
-                        <div class="grid grid-cols-2 gap-3">
-                            <div class="flex flex-col gap-1">
+                        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                            <div class="flex flex-col gap-1 min-w-0">
                                 <label class="text-xs text-surface-400">Impresora</label>
-                                <Select v-model="editForm.impresora" :options="printerOptions" class="w-full" />
+                                <Select v-model="editForm.impresora" :options="printerOptions" optionLabel="label" optionValue="value" class="w-full" />
                             </div>
-                            <div class="flex flex-col gap-1">
+                            <div class="flex flex-col gap-1 min-w-0">
                                 <label class="text-xs text-surface-400">Material</label>
                                 <Select v-model="editForm.filamento_tipo" :options="filamentOptions" class="w-full" />
                             </div>
-                            <div class="flex flex-col gap-1">
+                            <div class="flex flex-col gap-1 min-w-0">
                                 <label class="text-xs text-surface-400">Color</label>
                                 <Select v-model="editForm.filamento_color" :options="editColorOptions" optionLabel="label" optionValue="value" :disabled="editForm.is_multimaterial" class="w-full">
                                     <template #option="slotProps">
@@ -1668,15 +1866,15 @@ const saveModify = async () => {
                                     </template>
                                 </Select>
                             </div>
-                            <div class="flex flex-col gap-1">
+                            <div class="flex flex-col gap-1 min-w-0">
                                 <label class="text-xs text-surface-400">Peso (g)</label>
                                 <InputNumber v-model="editForm.peso_g" :disabled="editForm.is_multimaterial" class="w-full" />
                             </div>
-                            <div class="flex flex-col gap-1">
+                            <div class="flex flex-col gap-1 min-w-0">
                                 <label class="text-xs text-surface-400">Tiempo (h)</label>
                                 <InputNumber v-model="editForm.tiempo_h" :minFractionDigits="1" class="w-full" />
                             </div>
-                            <div class="flex flex-col gap-1">
+                            <div class="flex flex-col gap-1 min-w-0">
                                 <label class="text-xs text-surface-400">Cantidad (ud.)</label>
                                 <InputNumber v-model="editForm.cantidad" :min="1" :step="1" class="w-full" />
                             </div>
@@ -1728,32 +1926,54 @@ const saveModify = async () => {
                 <div class="flex flex-col gap-4">
                     <div class="p-3 card-inset rounded-xl">
                         <div class="text-xs font-semibold text-surface-500 uppercase tracking-wide mb-3">Factores de Coste</div>
-                        <div class="grid grid-cols-2 gap-3">
-                            <div class="flex flex-col gap-1">
-                                <label class="text-xs text-surface-400">Diseño</label>
-                                <Select v-model="editForm.diseno_modelado" :options="EDIT_OPTIONS.diseno" class="w-full" />
+                        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                            <div class="flex flex-col gap-1 col-span-full min-w-0">
+                                <label class="text-xs text-surface-400 flex items-center justify-between gap-2">
+                                    <span>Diseño</span>
+                                    <span class="text-[10px] text-surface-400">una vez por pedido</span>
+                                </label>
+                                <Select v-model="editForm.diseno_modelado" :options="editTarifas.diseno" optionLabel="label" optionValue="value" class="w-full">
+                                    <template #option="{ option }">
+                                        <div class="flex items-baseline justify-between gap-3 w-full min-w-0">
+                                            <span class="truncate">{{ option.label }}</span>
+                                            <span class="font-mono text-xs shrink-0" :class="option.eur > 0 || option.custom ? 'text-amber-600 dark:text-amber-400' : 'text-surface-400'">
+                                                {{ option.custom ? fmt(editLaborCostH) + '/h' : fmt(option.eur) }}
+                                            </span>
+                                        </div>
+                                    </template>
+                                </Select>
+                                <InputNumber v-if="editEsDisenoAMedida" v-model="editForm.diseno_horas" :min="0" :step="0.25"
+                                    :minFractionDigits="0" :maxFractionDigits="2" suffix=" h" class="w-full mt-1" />
                             </div>
-                            <div class="flex flex-col gap-1">
-                                <label class="text-xs text-surface-400">Búsqueda</label>
-                                <Select v-model="editForm.busqueda_modelos" :options="EDIT_OPTIONS.busqueda" class="w-full" />
+                            <div class="flex flex-col gap-1 col-span-full min-w-0">
+                                <label class="text-xs text-surface-400 flex items-center justify-between gap-2">
+                                    <span>Post-procesado <span class="text-[10px]">(incluye soportes)</span></span>
+                                    <span v-if="editCantidadUds > 1" class="text-[10px] text-amber-600 dark:text-amber-400">× {{ editCantidadUds }} uds.</span>
+                                </label>
+                                <Select v-model="editForm.postprocesado" :options="editTarifas.postproc" optionLabel="label" optionValue="value" class="w-full">
+                                    <template #option="{ option }">
+                                        <div class="flex items-baseline justify-between gap-3 w-full min-w-0">
+                                            <span class="truncate">{{ option.label }}</span>
+                                            <span class="font-mono text-xs shrink-0" :class="option.eur > 0 ? 'text-amber-600 dark:text-amber-400' : 'text-surface-400'">
+                                                {{ fmt(option.eur) }}<span v-if="editCantidadUds > 1" class="text-surface-400">/ud.</span>
+                                            </span>
+                                        </div>
+                                    </template>
+                                </Select>
                             </div>
-                            <div class="flex flex-col gap-1">
-                                <label class="text-xs text-surface-400">Soportes</label>
-                                <Select v-model="editForm.eliminacion_soportes" :options="EDIT_OPTIONS.soportes" class="w-full" />
-                            </div>
-                            <div class="flex flex-col gap-1">
-                                <label class="text-xs text-surface-400">Postprocesado</label>
-                                <Select v-model="editForm.postprocesado" :options="EDIT_OPTIONS.postproc" class="w-full" />
-                            </div>
-                            <div class="flex flex-col gap-1">
+                            <div class="flex flex-col gap-1 min-w-0">
                                 <label class="text-xs text-surface-400">Prob. Error</label>
                                 <Select v-model="editForm.probabilidad_error" :options="EDIT_OPTIONS.probError" optionLabel="label" optionValue="value" class="w-full" />
                             </div>
-                            <div class="flex flex-col gap-1">
+                            <div class="flex flex-col gap-1 min-w-0">
                                 <label class="text-xs text-surface-400">Markup</label>
-                                <Select v-model="editForm.markup" :options="EDIT_OPTIONS.markup" class="w-full" />
+                                <Select v-if="editMarkupOptions.length > 1" v-model="editForm.markup" :options="editMarkupOptions" class="w-full" />
+                                <div v-else class="flex items-center gap-2 px-3 py-2.5 rounded-lg card-inset text-xs text-surface-500">
+                                    <span>{{ editForm.markup }}</span>
+                                    <i class="pi pi-lock text-[10px] ml-auto" />
+                                </div>
                             </div>
-                            <div class="flex flex-col gap-1 col-span-2">
+                            <div class="flex flex-col gap-1 col-span-full min-w-0">
                                 <label class="text-xs text-surface-400">Urgencia</label>
                                 <Select v-model="editForm.urgencia_nivel" :options="EDIT_OPTIONS.urgencia" class="w-full" />
                             </div>
@@ -1838,13 +2058,12 @@ const saveModify = async () => {
             </div>
         </template>
     </Dialog>
-    <ConfirmDialog />
 
     <!-- ═══ Link amount Dialog ═══ -->
     <Dialog v-model:visible="linkDialog.visible" modal header="Generar enlace de pago" :style="{ width: 'min(90vw, 26rem)' }">
         <div class="flex flex-col gap-4 p-1">
             <div class="text-sm text-surface-500">Pendiente: <strong>{{ fmt(linkDialog.pending) }}</strong></div>
-            <div class="flex flex-col gap-1">
+            <div class="flex flex-col gap-1 min-w-0">
                 <label class="text-xs text-surface-500 uppercase tracking-wider font-semibold">Importe a cobrar</label>
                 <InputNumber v-model="linkDialog.amount" :min="0.01" :minFractionDigits="2" :maxFractionDigits="2" class="w-full" />
                 <small class="text-surface-400">Puede ser mayor que el pendiente (incluye propina)</small>

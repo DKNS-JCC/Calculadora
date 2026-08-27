@@ -9,7 +9,7 @@
  * Usage:  import { api, isElectron, isCapacitor } from './platform'
  */
 
-import * as backend from './shared/backend.js'
+import * as backend from './shared/backend.mjs'
 
 /* ── Platform detection ────────────────────────────────────────────────── */
 
@@ -90,8 +90,8 @@ const webApi = {
     return { order, data: cachedData }
   },
 
-  async setOrderAccepted(orderId, partnerStock) {
-    const response = backend.setOrderAccepted(cachedData, orderId, partnerStock || null)
+  async setOrderAccepted(orderId) {
+    const response = backend.setOrderAccepted(cachedData, orderId)
     const order = cachedData.orders.find((o) => o.id === orderId)
     return { ...response, order, inventory: cachedData.filament_stock, data: cachedData }
   },

@@ -1,6 +1,6 @@
 import { reactive } from 'vue'
-import { onAuthChange, getUserEmpresa, logout as firebaseLogout } from './firebase'
-import * as fsService from './firestoreService'
+import { onAuthChange, getUserEmpresa, logout as firebaseLogout } from './supabase'
+import * as fsService from './supabaseService'
 import { api } from './platform'
 
 export const store = reactive({
@@ -13,6 +13,13 @@ export const store = reactive({
   appData: null,
   isLoaded: false,
   lastResult: null,
+
+  /* ── Presupuesto web pendiente de convertir en pedido (bandeja fase 2) ──── */
+  // { id, codigo, prefill: {...} } — lo fija WebQuotesInbox; Calculator lo
+  // precarga; saveOrderFromResult enlaza el pedido y lo limpia.
+  pendingWebQuote: null,
+  // Solicitudes web sin pedido (para el badge de la pestaña Pedidos).
+  webQuotesCount: 0,
 
   /* ── Ghost mode (hidden: Ctrl+Shift+G) ──────────────────────────────────── */
   ghostMode: false,
@@ -88,93 +95,7 @@ export const store = reactive({
 
     this.isLoaded = true
 
-    // CRM Migration: If clients list is empty, populate from history
-    if ((!this.appData.clients || this.appData.clients.length === 0) && this.appData.orders.length > 0) {
-      await this._migrateClientsFromOrders()
-    }
-
     await this._migrateOrdersIfNeeded()
-  },
-
-  async _migrateClientsFromOrders() {
-    console.log('[CRM] Migrating clients from historical orders...')
-    const clientMap = new Map()
-    // Process orders from oldest to newest to capture the most recent email/details
-    const sortedOrders = [...this.appData.orders].sort((a, b) => 
-      (a.created_at || a.fecha || '').localeCompare(b.created_at || b.fecha || '')
-    )
-
-    for (const order of sortedOrders) {
-      const name = String(order.cliente || '').trim()
-      if (!name) continue
-      
-      const email = String(order.cliente_email || '').trim()
-      const existing = clientMap.get(name)
-      
-      if (!existing) {
-        clientMap.set(name, {
-          id: `cl_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`,
-          name,
-          email,
-          phone: '',
-          tax_id: '',
-          address: '',
-          default_discount: 0,
-          notes: 'Migrado automáticamente del historial.'
-        })
-      } else if (email && !existing.email) {
-        existing.email = email
-      }
-    }
-
-    if (clientMap.size > 0) {
-      this.appData.clients = Array.from(clientMap.values())
-      await fsService.saveClients(this.empresa, this.appData.clients)
-      console.log(`[CRM] Migrated ${clientMap.size} clients.`)
-    }
-  },
-
-  async _ensureClientExists(order) {
-    if (!order.cliente) return
-    const name = String(order.cliente).trim()
-    if (!this.appData.clients) this.appData.clients = []
-    
-    const existing = this.appData.clients.find(c => c.name.toLowerCase() === name.toLowerCase())
-    if (!existing) {
-      await this.addClient({
-        name,
-        email: order.cliente_email || '',
-        phone: '',
-        tax_id: '',
-        address: '',
-        default_discount: 0,
-        notes: `Creado automáticamente desde el pedido #${order.id}`
-      })
-    } else if (order.cliente_email && !existing.email) {
-      // Update email if the order has one but the CRM entry doesn't
-      await this.updateClient({ clientId: existing.id, updates: { email: order.cliente_email } })
-    }
-  },
-
-  async addClient(client) {
-    const newClient = { ...client, id: client.id || `cl_${Date.now()}` }
-    if (!this.appData.clients) this.appData.clients = []
-    this.appData.clients.push(newClient)
-    await fsService.saveClients(this.empresa, this.appData.clients)
-    return newClient
-  },
-
-  async updateClient({ clientId, updates }) {
-    const idx = this.appData.clients.findIndex(c => c.id === clientId)
-    if (idx !== -1) {
-      this.appData.clients[idx] = { ...this.appData.clients[idx], ...updates }
-      await fsService.saveClients(this.empresa, this.appData.clients)
-    }
-  },
-
-  async removeClient(clientId) {
-    this.appData.clients = this.appData.clients.filter(c => c.id !== clientId)
-    await fsService.saveClients(this.empresa, this.appData.clients)
   },
 
   async _migrateOrdersIfNeeded() {
@@ -280,13 +201,13 @@ export const store = reactive({
       is_multimaterial: !!order.is_multimaterial,
       material_breakdown: Array.isArray(order.material_breakdown) ? order.material_breakdown.map(l => ({ ...l })) : [],
       is_shared: !!order.is_shared,
+      partner_printers: order.is_shared ? JSON.parse(JSON.stringify(this.partnerInventory?.printers || [])) : [],
       shared_percent_3dcc: order.shared_split?.['3DCC'] ?? 50,
       shared_percent_silab3d: order.shared_split?.['SILAB3D'] ?? 50,
       gasto_misc: Number(order.gasto_misc || 0),
       diseno_modelado: order.diseno_modelado || 'No necesario',
-      busqueda_modelos: order.busqueda_modelos || 'No',
-      eliminacion_soportes: order.eliminacion_soportes || 'No',
-      postprocesado: order.postprocesado_label || 'No',
+      diseno_horas: Number(order.diseno_horas || 0),
+      postprocesado: order.postprocesado_label || 'Limpio',
       probabilidad_error: order.probabilidad_error_label || 'Baja',
       markup: order.markup_label || 'Normal (230%)',
       urgencia_nivel: order.urgencia_nivel || 'Normal',
@@ -297,6 +218,8 @@ export const store = reactive({
   async _generateClientPdfBase64(order) {
     if (!api?.calculate || !api?.getTicketPdfBuffer) return null
     try {
+      // Pedidos compartidos pueden usar una impresora del socio
+      if (order.is_shared && !this.partnerInventory) await this.loadPartnerInventory()
       const payload = this._buildOrderCalcPayload(order)
       const calcResult = await api.calculate(structuredClone(payload))
       const summary = {
@@ -327,6 +250,33 @@ export const store = reactive({
     const email = String(order.cliente_email || '').trim()
     if (!email) return null
     if (oldStatus === newStatus) return null
+
+    // Pedidos enlazados a una solicitud web: avisar vía la edge function
+    // notify-quote (plantillas de la web + enlace de estado; funciona
+    // también en móvil y no depende del SMTP de escritorio). El trigger ya
+    // proyectó el nuevo estado a la quote antes de llegar aquí.
+    if (order.quote_id && typeof fsService.notifyWebQuote === 'function') {
+      try {
+        const res = await fsService.notifyWebQuote(order.quote_id)
+        if (!Array.isArray(order.notif_history)) order.notif_history = []
+        order.notif_history.push({
+          sent_at: new Date().toISOString(),
+          to: email,
+          from_status: oldStatus || '',
+          to_status: newStatus,
+          ok: !!res?.ok,
+          attached_pdf: false,
+          via: 'web',
+          error: res?.ok ? '' : String(res?.error || ''),
+        })
+        await fsService.saveOrder(this.empresa, order)
+        return res
+      } catch (e) {
+        console.error('[notify] web failed:', e)
+        return { ok: false, error: e.message }
+      }
+    }
+
     const cfg = this.appData?.global_config || {}
     if (!cfg.email_enabled) return null
     if (!api?.sendOrderStatusEmail) return null
@@ -381,9 +331,21 @@ export const store = reactive({
     const res = await api.saveOrderFromResult(JSON.parse(JSON.stringify(resultInfo)))
     this._applyOrdersUpdate(res.data.orders)
     await fsService.saveOrder(this._getOrderEmpresaToSave(res.order), res.order)
-    
+
+    // Enlazar con el presupuesto web pendiente (bandeja fase 2)
+    if (this.pendingWebQuote?.id && typeof fsService.linkOrderToQuote === 'function') {
+      try {
+        await fsService.linkOrderToQuote(this.empresa, res.order.id, this.pendingWebQuote.id)
+        res.order.quote_id = this.pendingWebQuote.id
+        res.order._webCodigo = this.pendingWebQuote.codigo || ''
+        this.webQuotesCount = Math.max(0, this.webQuotesCount - 1)
+      } catch (e) {
+        console.warn('[webquote] No se pudo enlazar el presupuesto web:', e.message)
+      }
+      this.pendingWebQuote = null
+    }
+
     // CRM: Ensure client exists in database
-    await this._ensureClientExists(res.order)
 
     // Initial state: notify "Presupuesto enviado" if email exists
     if (!options.skipNotification) {
@@ -394,25 +356,16 @@ export const store = reactive({
 
   async acceptOrder(orderId, options = {}) {
     if (this.ghostMode) return
-    // For shared orders, load partner inventory first
     const order = this.appData.orders.find(o => o.id === orderId)
     const oldStatus = order?.estado || ''
-    let partnerInv = null
-    if (order?.is_shared) {
-      partnerInv = await fsService.loadPartnerInventory(this.empresa)
-    }
 
-    const res = await api.setOrderAccepted(orderId, partnerInv?.filament_stock || null)
+    const res = await api.setOrderAccepted(orderId)
     this._applyOrdersUpdate(res.data.orders)
     if (res.data.filament_stock) this.appData.filament_stock = res.data.filament_stock
     const promises = [fsService.saveOrder(this._getOrderEmpresaToSave(res.order), res.order)]
-    // Material may have been consumed → save own inventory
+    // Se ha apuntado material gastado → guardar el catálogo
     if (res.inventory) {
       promises.push(fsService.saveInventory(this.empresa, res.inventory))
-    }
-    // If partner stock was also consumed, persist it
-    if (res.partnerStockUsed && res.partnerStock) {
-      promises.push(fsService.savePartnerInventory(this.empresa, res.partnerStock))
     }
     await Promise.all(promises)
     if (!options.skipNotification) {
@@ -452,7 +405,6 @@ export const store = reactive({
     await fsService.saveOrder(this._getOrderEmpresaToSave(res.order), res.order)
     
     // CRM: Ensure client exists or email is updated
-    if (res.order) await this._ensureClientExists(res.order)
 
     if (res.order && oldStatus !== res.order.estado && !options.skipNotification) {
       this._notifyStatusChange(res.order, oldStatus, res.order.estado, options).catch(() => {})
@@ -546,7 +498,7 @@ export const store = reactive({
       this.partnerInventory = await fsService.loadPartnerInventory(this.empresa)
     } catch (e) {
       console.error('Error loading partner inventory:', e)
-      this.partnerInventory = { filament_stock: [], filament_types: [], partner: null }
+      this.partnerInventory = { filament_stock: [], filament_types: [], printers: [], partner: null }
     }
     return this.partnerInventory
   },

@@ -23,15 +23,23 @@ async function handleLogin() {
     errorMsg.value = ''
 
     try {
-        const { loginWithEmail, saveUserEmpresa } = await import('../firebase')
+        const { loginWithEmail, saveUserEmpresa, logout } = await import('../supabase')
         const user = await loginWithEmail(email.value.trim(), password.value)
-        // Persist the user→empresa mapping (skips write if unchanged)
-        await saveUserEmpresa(user.uid, empresa.value, user.email)
+        // Valida que la empresa seleccionada coincide con la asignada en
+        // empresa_users (lanza auth/no-empresa o auth/empresa-mismatch).
+        try {
+            await saveUserEmpresa(user.uid, empresa.value, user.email)
+        } catch (inner) {
+            await logout()
+            throw inner
+        }
         emit('login-success', { uid: user.uid, email: user.email, empresa: empresa.value })
     } catch (e) {
         console.error('Login error:', e)
         if (e.code === 'auth/invalid-credential' || e.code === 'auth/wrong-password' || e.code === 'auth/user-not-found') {
             errorMsg.value = 'Correo o contraseña incorrectos.'
+        } else if (e.code === 'auth/no-empresa' || e.code === 'auth/empresa-mismatch') {
+            errorMsg.value = e.message
         } else if (e.code === 'auth/invalid-email') {
             errorMsg.value = 'El correo no es válido.'
         } else if (e.code === 'auth/too-many-requests') {

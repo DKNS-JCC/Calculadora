@@ -1,6 +1,6 @@
 {
   "name": "3dcalc",
-  "version": "6.0.0",
+  "version": "7.0.0",
   "description": "Calculadora 3D para presupuestos de impresión 3D",
   "main": "electron-main/main.js",
   "author": {
@@ -13,11 +13,14 @@
     "build:win": "vite build",
     "publish": "node scripts/publish-electron.js",
     "publish:android": "node scripts/publish-android.js",
+    "dev:android": "concurrently \"vite --host 0.0.0.0 --port 5173 --strictPort\" \"wait-on http://127.0.0.1:5173 && npx cap run android -l --host localhost --port 5173 --forwardPorts 5173:5173\"",
+    "dev:android:wifi": "concurrently \"vite --host 0.0.0.0 --port 5173 --strictPort\" \"wait-on http://127.0.0.1:5173 && npx cap run android -l --port 5173\"",
     "build:mobile": "vite build && npx cap sync",
     "cap:sync": "npx cap sync",
     "cap:open:android": "npx cap open android",
     "cap:run:android": "vite build && npx cap sync android && npx cap run android",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "migrate:firestore": "node scripts/migrate-firestore-supabase.mjs"
   },
   "dependencies": {
     "@capacitor-community/file-opener": "^8.0.0",
@@ -32,13 +35,15 @@
     "@capacitor/keyboard": "^8.0.0",
     "@capacitor/share": "^8.0.1",
     "@capacitor/status-bar": "^8.0.1",
+    "@supabase/supabase-js": "^2.49.0",
+    "electron-log": "^5.2.4",
     "electron-updater": "^6.8.3",
-    "firebase": "^12.9.0",
     "nodemailer": "^8.0.7",
     "pdfkit": "^0.17.2",
     "stripe": "^18.5.0"
   },
   "devDependencies": {
+    "firebase-admin": "^13.0.0",
     "@primevue/themes": "^4.5.4",
     "@tailwindcss/vite": "^4.1.18",
     "@vitejs/plugin-vue": "^6.0.4",
@@ -66,9 +71,16 @@
     "files": [
       "dist/**/*",
       "electron-main/**/*",
+      "src/shared/**/*",
       "logos/**/*",
       "icon.ico",
-      "package.json"
+      "package.json",
+      "!node_modules/@capacitor/**",
+      "!node_modules/firebase/**",
+      "!node_modules/@firebase/**",
+      "!node_modules/@supabase/**",
+      "!node_modules/@grpc/**",
+      "!node_modules/protobufjs/**"
     ],
     "asarUnpack": [
       "node_modules/pdfkit/**/*",
@@ -83,6 +95,7 @@
       ]
     },
     "nsis": {
+      "include": "build/installer.nsh",
       "installerIcon": "icon.ico",
       "uninstallerIcon": "icon.ico",
       "oneClick": true,

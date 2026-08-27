@@ -18,6 +18,7 @@ import Message from 'primevue/message'
 import ToggleSwitch from 'primevue/toggleswitch'
 import Textarea from 'primevue/textarea'
 import { useToast } from 'primevue/usetoast'
+import { laborOptions } from '../shared/backend.mjs'
 import PurgeMatrix from './PurgeMatrix.vue'
 
 const config = computed(() => store.appData.global_config)
@@ -26,6 +27,17 @@ const materials = computed(() => store.appData.filament_types)
 
 const saved = ref(false)
 const toast = useToast()
+
+/* Tarifario de mano de obra: se deriva del coste/hora, así que se muestra
+ * aquí en vivo para ver qué importes produce el valor que se está editando. */
+const tarifaUnit = (v) => `${Number(v || 0).toFixed(2)} ${config.value?.money_unit || '€'}`
+const tarifario = computed(() => {
+    const opts = laborOptions({ labor_cost_h: Number(config.value?.labor_cost_h || 0) })
+    return [
+        { titulo: 'Diseño', filas: opts.diseno, nota: 'Se cobra una vez por pedido.' },
+        { titulo: 'Post-procesado', filas: opts.postproc, nota: 'Incluye soportes. Se multiplica por cada pieza.' },
+    ]
+})
 const emailTesting = ref(false)
 const emailTestTo = ref('')
 
@@ -69,6 +81,61 @@ const sendTestEmail = async () => {
         emailTesting.value = false
     }
 }
+
+const PDF_BRAND_PRESETS = {
+    '3DCC': { primary: '#2563eb', headerStyle: 'dark', tagline: 'Impresión 3D profesional' },
+    'SILAB3D': { primary: '#0f766e', headerStyle: 'light', tagline: 'Fabricación digital y prototipado' },
+}
+
+const pdfLogoPreview = ref('')
+
+const ensurePdfBrandingDefaults = () => {
+    const c = config.value
+    const preset = PDF_BRAND_PRESETS[String(store.empresa || '').toUpperCase()] || { primary: '#2563eb', headerStyle: 'dark', tagline: '' }
+    if (c.pdf_show_logo === undefined) c.pdf_show_logo = true
+    if (!c.pdf_primary_color) c.pdf_primary_color = preset.primary
+    if (!c.pdf_header_style) c.pdf_header_style = preset.headerStyle
+    if (!c.pdf_tagline) c.pdf_tagline = preset.tagline
+    ;['pdf_logo_path', 'pdf_company_legal', 'pdf_contact_email', 'pdf_contact_phone', 'pdf_contact_web', 'pdf_contact_address', 'pdf_conditions', 'pdf_footer_note'].forEach((k) => {
+        if (c[k] === undefined) c[k] = ''
+    })
+}
+ensurePdfBrandingDefaults()
+
+const loadPdfLogoPreview = async () => {
+    const p = String(config.value.pdf_logo_path || '').trim()
+    if (!p || !api.readImageAsBase64) { pdfLogoPreview.value = ''; return }
+    try {
+        const r = await api.readImageAsBase64(p)
+        pdfLogoPreview.value = r?.ok ? `data:${r.mimeType};base64,${r.data}` : ''
+    } catch { pdfLogoPreview.value = '' }
+}
+loadPdfLogoPreview()
+
+const selectPdfLogo = async () => {
+    if (!api.openImageFilePicker) return
+    const res = await api.openImageFilePicker()
+    if (res && !res.canceled && res.filePath) {
+        config.value.pdf_logo_path = res.filePath
+        await loadPdfLogoPreview()
+    }
+}
+
+const clearPdfLogo = () => {
+    config.value.pdf_logo_path = ''
+    pdfLogoPreview.value = ''
+}
+
+const pdfHeaderPreviewStyle = computed(() => (
+    config.value.pdf_header_style === 'light' ? { background: '#ffffff', border: '1px solid #e2e8f0' } : { background: '#0f172a' }
+))
+const pdfHeaderTextColor = computed(() => (config.value.pdf_header_style === 'light' ? '#0f172a' : '#ffffff'))
+const defaultConditionsPlaceholder = [
+    'El coste indicado es el precio final del proyecto, incluyendo todos los gastos necesarios.',
+    'El tiempo de entrega depende de la complejidad del proyecto y la cola de trabajo en curso.',
+    'Se requiere el abono del 50% del presupuesto como anticipo para iniciar la producción.',
+].join('\n')
+
 
 const handleLogout = async () => {
     try {
@@ -213,6 +280,7 @@ const selectPdfFolder = async () => {
             <Tab value="3"><i class="pi pi-sync mr-2" />Purgas</Tab>
             <Tab value="4"><i class="pi pi-credit-card mr-2" />Stripe</Tab>
             <Tab value="5"><i class="pi pi-envelope mr-2" />Notificaciones</Tab>
+            <Tab value="6"><i class="pi pi-id-card mr-2" />Marca / PDF</Tab>
         </TabList>
         <TabPanels>
             <!-- General Settings -->
@@ -240,6 +308,26 @@ const selectPdfFolder = async () => {
                             <div class="flex items-center gap-2">
                                 <input type="color" v-model="config.brand_color" class="w-10 h-10 p-0 border-0 bg-transparent cursor-pointer rounded overflow-hidden" />
                                 <InputText v-model="config.brand_color" class="flex-1" placeholder="#3b82f6" />
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Tarifario derivado del coste/hora -->
+                    <div class="rounded-xl border border-black/[0.06] dark:border-white/[0.08] overflow-hidden">
+                        <div class="px-4 py-2.5 border-b border-black/[0.06] dark:border-white/[0.08] flex items-baseline justify-between gap-2">
+                            <span class="text-sm font-medium">Tarifario de mano de obra</span>
+                            <span class="text-xs text-surface-400">a {{ tarifaUnit(config.labor_cost_h) }}/h</span>
+                        </div>
+                        <div class="p-4 grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-4">
+                            <div v-for="grupo in tarifario" :key="grupo.titulo" class="flex flex-col gap-1.5">
+                                <div class="text-[11px] uppercase font-semibold tracking-wide text-surface-400">{{ grupo.titulo }}</div>
+                                <div v-for="t in grupo.filas" :key="t.value" class="flex items-baseline justify-between gap-3 text-sm">
+                                    <span class="truncate text-surface-600 dark:text-surface-300">{{ t.label }}</span>
+                                    <span class="font-mono shrink-0" :class="t.eur > 0 || t.custom ? 'text-amber-600 dark:text-amber-400' : 'text-surface-400'">
+                                        {{ t.custom ? tarifaUnit(config.labor_cost_h) + '/h' : tarifaUnit(t.eur) }}
+                                    </span>
+                                </div>
+                                <div class="text-[11px] text-surface-400 mt-0.5">{{ grupo.nota }}</div>
                             </div>
                         </div>
                     </div>
@@ -446,6 +534,122 @@ const selectPdfFolder = async () => {
                             <Button label="Enviar prueba" icon="pi pi-paper-plane" severity="info" :loading="emailTesting"
                                 @click="sendTestEmail" :disabled="!config.email_enabled || !config.email_from || !config.email_app_password" />
                         </div>
+                    </div>
+                </div>
+            </TabPanel>
+
+            <!-- PDF / Marca -->
+            <TabPanel value="6">
+                <div class="max-w-3xl flex flex-col gap-5 pt-2">
+                    <Message severity="info" :closable="false">
+                        Personaliza el PDF de presupuesto que reciben tus clientes. Cada empresa guarda su propia marca,
+                        de modo que <strong>{{ store.empresa }}</strong> genera un documento distinto al de la otra marca.
+                    </Message>
+
+                    <!-- Live preview of the PDF header -->
+                    <div class="rounded-2xl overflow-hidden border border-black/[0.05] dark:border-white/[0.06]">
+                        <div class="px-5 py-4 flex items-center gap-3" :style="pdfHeaderPreviewStyle">
+                            <img v-if="config.pdf_show_logo && pdfLogoPreview" :src="pdfLogoPreview" class="w-14 h-14 object-contain rounded" />
+                            <div v-else-if="config.pdf_show_logo" class="w-14 h-14 rounded bg-black/10 dark:bg-white/10 flex items-center justify-center text-[10px] uppercase tracking-wider" :style="{ color: pdfHeaderTextColor }">Logo</div>
+                            <div class="min-w-0 flex-1">
+                                <div class="font-bold text-xl leading-tight truncate" :style="{ color: pdfHeaderTextColor }">{{ config.pdf_company_legal || store.empresa }}</div>
+                                <div v-if="config.pdf_tagline" class="text-[11px] font-bold uppercase tracking-wide truncate mt-0.5" :style="{ color: config.pdf_primary_color }">{{ config.pdf_tagline }}</div>
+                            </div>
+                            <div class="text-right text-[10px] leading-snug shrink-0" :style="{ color: pdfHeaderTextColor, opacity: 0.7 }">
+                                <div v-if="config.pdf_contact_email">{{ config.pdf_contact_email }}</div>
+                                <div v-if="config.pdf_contact_phone">{{ config.pdf_contact_phone }}</div>
+                                <div v-if="config.pdf_contact_web">{{ config.pdf_contact_web }}</div>
+                            </div>
+                        </div>
+                        <div class="h-1.5" :style="{ background: config.pdf_primary_color }" />
+                        <div class="px-4 py-2 text-[11px] text-surface-400 bg-surface-50 dark:bg-surface-800">Vista previa de la cabecera del presupuesto</div>
+                    </div>
+
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        <div class="flex flex-col gap-1">
+                            <label class="text-sm font-medium">Nombre en el documento</label>
+                            <InputText v-model="config.pdf_company_legal" class="w-full" :placeholder="store.empresa" />
+                        </div>
+                        <div class="flex flex-col gap-1">
+                            <label class="text-sm font-medium">Eslogan / subtítulo</label>
+                            <InputText v-model="config.pdf_tagline" class="w-full" placeholder="Ej: Impresión 3D profesional" />
+                        </div>
+                        <div class="flex flex-col gap-1">
+                            <label class="text-sm font-medium">Color principal</label>
+                            <div class="flex items-center gap-2">
+                                <input type="color" v-model="config.pdf_primary_color" class="w-10 h-10 p-0 border-0 bg-transparent cursor-pointer rounded overflow-hidden" />
+                                <InputText v-model="config.pdf_primary_color" class="flex-1" placeholder="#2563eb" />
+                            </div>
+                        </div>
+                        <div class="flex flex-col gap-1">
+                            <label class="text-sm font-medium">Estilo de cabecera</label>
+                            <select v-model="config.pdf_header_style" class="w-full h-10 px-3 rounded-md border border-surface-300 dark:border-surface-600 bg-surface-0 dark:bg-surface-900 text-sm">
+                                <option value="dark">Oscura (fondo oscuro)</option>
+                                <option value="light">Clara (fondo blanco)</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <!-- Logo -->
+                    <div class="rounded-2xl card-inset p-4 flex flex-col gap-3 border border-black/[0.05] dark:border-white/[0.06]">
+                        <div class="flex items-center justify-between">
+                            <div class="flex items-center gap-2">
+                                <i class="pi pi-image text-primary-500" />
+                                <span class="font-semibold">Logo</span>
+                            </div>
+                            <ToggleSwitch v-model="config.pdf_show_logo" />
+                        </div>
+                        <div v-if="isElectron()" class="flex gap-2 items-center">
+                            <InputText v-model="config.pdf_logo_path" class="flex-1" placeholder="Logo por defecto de la empresa" :disabled="!config.pdf_show_logo" />
+                            <Button icon="pi pi-folder-open" severity="secondary" outlined @click="selectPdfLogo" :disabled="!config.pdf_show_logo" />
+                            <Button icon="pi pi-times" severity="secondary" text @click="clearPdfLogo" :disabled="!config.pdf_show_logo || !config.pdf_logo_path" v-tooltip.bottom="'Usar logo por defecto'" />
+                        </div>
+                        <small class="text-surface-400">Si lo dejas vacío se usa el logo por defecto de {{ store.empresa }}. Formato PNG o JPG.</small>
+                    </div>
+
+                    <!-- Contact block -->
+                    <div class="rounded-2xl card-inset p-4 flex flex-col gap-3 border border-black/[0.05] dark:border-white/[0.06]">
+                        <div class="flex items-center gap-2">
+                            <i class="pi pi-address-book text-violet-500" />
+                            <span class="font-semibold">Datos de contacto en el PDF</span>
+                        </div>
+                        <p class="text-sm text-surface-500 dark:text-surface-400 -mt-1">Aparecen en la cabecera y el pie del documento. Sólo se muestran los que rellenes.</p>
+                        <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+                            <div class="flex flex-col gap-1">
+                                <label class="text-xs font-medium">Email</label>
+                                <InputText v-model="config.pdf_contact_email" class="w-full" :placeholder="config.email_from || 'contacto@tuempresa.com'" />
+                            </div>
+                            <div class="flex flex-col gap-1">
+                                <label class="text-xs font-medium">Teléfono / WhatsApp</label>
+                                <InputText v-model="config.pdf_contact_phone" class="w-full" :placeholder="config.email_whatsapp || '+34 600 123 456'" />
+                            </div>
+                            <div class="flex flex-col gap-1">
+                                <label class="text-xs font-medium">Web</label>
+                                <InputText v-model="config.pdf_contact_web" class="w-full" :placeholder="config.email_website || 'https://tuempresa.com'" />
+                            </div>
+                            <div class="flex flex-col gap-1">
+                                <label class="text-xs font-medium">Dirección</label>
+                                <InputText v-model="config.pdf_contact_address" class="w-full" placeholder="C/ Mayor, 12 — Ciudad" />
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Conditions + footer -->
+                    <div class="grid grid-cols-1 gap-3">
+                        <div class="flex flex-col gap-1">
+                            <label class="text-sm font-medium">Condiciones del presupuesto</label>
+                            <Textarea v-model="config.pdf_conditions" rows="5" autoResize class="w-full text-sm" :placeholder="defaultConditionsPlaceholder" />
+                            <small class="text-surface-400">Una condición por línea. Si lo dejas vacío se usan las condiciones estándar.</small>
+                        </div>
+                        <div class="flex flex-col gap-1">
+                            <label class="text-sm font-medium">Nota de pie de página</label>
+                            <InputText v-model="config.pdf_footer_note" class="w-full" :placeholder="config.email_footer_note || 'Gracias por confiar en nosotros'" />
+                        </div>
+                    </div>
+
+                    <div class="flex items-center gap-3">
+                        <Button label="Guardar marca" icon="pi pi-save" @click="saveConfig" />
+                        <Message v-if="saved" severity="success" :closable="false">Guardado correctamente</Message>
                     </div>
                 </div>
             </TabPanel>

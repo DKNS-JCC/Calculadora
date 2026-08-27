@@ -8,8 +8,6 @@ import Tooltip from 'primevue/tooltip'
 import './style.css'
 import 'primeicons/primeicons.css'
 
-import { Chart, registerables } from 'chart.js'
-Chart.register(...registerables)
 
 const app = createApp(App)
 

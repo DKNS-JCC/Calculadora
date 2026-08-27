@@ -1,23 +1,72 @@
 /**
- * Shared business logic — runs in both Electron main process and browser (Capacitor/Web).
+ * Shared business logic — ÚNICA FUENTE DE VERDAD.
  *
- * This is an ES-module version of electron-main/backend.js with all pure
- * computation (no Node.js dependencies like fs, path, PDFKit, or Stripe).
+ * Este módulo corre tanto en el proceso main de Electron (PC) como en el
+ * navegador (Capacitor/Web). Solo computación pura: sin fs, path, PDFKit
+ * ni Stripe. La parte Stripe (requiere Node) vive en electron-main/backend.js,
+ * que reexporta este módulo y añade generateStripePaymentLink.
+ *
+ * ⚠️ No dupliques lógica de negocio en electron-main: cualquier cambio aquí
+ * aplica automáticamente a PC y móvil.
  */
 
 /* ── Lookup tables ─────────────────────────────────────────────────────── */
 
+/* Tarifas de mano de obra ─ expresadas en MINUTOS y valoradas a
+ * global_config.labor_cost_h. A 15 €/h resultan los importes del tarifario:
+ *
+ *   DISEÑO           No necesario 0,00 · Básica 2,25 · Búsqueda 3,75
+ *                    Media 7,50 · Alta 15,00 · A medida = horas × coste/h
+ *   POST-PROCESADO   Limpio 0,00 · Sencillo 5,00 · Medio 10,00 · Avanzado 20,00
+ *
+ * El diseño se cobra una vez por pedido; el post-procesado se multiplica por
+ * la cantidad de piezas, porque lijar/pintar 10 unidades cuesta 10 veces más.
+ */
+
+export const DISENO_A_MEDIDA = 'A medida (por horas)'
+
 export const DISENO_MODELADO = {
   'No necesario': 0,
-  'Chorrada - En Slicer': 0.15,
-  "Fácil - Fusión 30'": 1/3,
-  "Medio - Fusión 60'": 2/3,
-  'Avanzado - AI + Remesh': 1,
+  'Básica (slicer)': 9,
+  'Búsqueda de modelos': 15,
+  'Media (Fusion <1h)': 30,
+  'Alta (Fusion >1h / Artístico)': 60,
+  [DISENO_A_MEDIDA]: 0, // se sustituye por diseno_horas × 60
 }
+
+export const POSTPROCESADO = {
+  Limpio: 0,
+  'Sencillo (lijado)': 20,
+  'Medio (lijado + ensamblado)': 40,
+  'Avanzado (+ pintura)': 80,
+}
+
+/* Descripciones largas para la interfaz (mismo orden que las tablas). */
+export const DISENO_MODELADO_DESC = {
+  'No necesario': 'El cliente aporta el archivo listo para imprimir',
+  'Básica (slicer)': 'Solo ajustes en el laminador: escala, orientación, corte',
+  'Búsqueda de modelos': 'Localizar y verificar un modelo existente en repositorios',
+  'Media (Fusion <1h)': 'Modelado o edición en Fusion de menos de una hora',
+  'Alta (Fusion >1h / Artístico)': 'Modelado de más de una hora, orgánico o artístico',
+  [DISENO_A_MEDIDA]: 'Encargo grande: se cobran las horas reales al coste/hora',
+}
+
+export const POSTPROCESADO_DESC = {
+  Limpio: 'Pocos soportes, sin lijado. Sale de la cama y se entrega',
+  'Sencillo (lijado)': 'Pocos soportes con lijado de las marcas',
+  'Medio (lijado + ensamblado)': 'Lijado y ensamblado, o soportes comprometidos',
+  'Avanzado (+ pintura)': 'Lijado / ensamblado / soportes difíciles más pintura',
+}
+
+/* ── Compatibilidad con pedidos anteriores al tarifario ───────────────── */
+
+/* Antes había cuatro desplegables: Diseño, Búsqueda, Soportes y Postprocesado.
+ * Búsqueda se fusionó en Diseño y Soportes en Post-procesado. Estas tablas
+ * solo sirven para releer pedidos guardados con las etiquetas antiguas. */
 
 export const BUSQUEDA_MODELOS = {
   No: 0,
-  'Sí': 0.25,
+  'Sí': 15,
 }
 
 export const ELIMINACION_SOPORTES = {
@@ -26,11 +75,71 @@ export const ELIMINACION_SOPORTES = {
   'Muchos / Elevada dificultad': 45,
 }
 
-export const POSTPROCESADO = {
-  No: 0,
-  'Sencillo (Lijado ligero)': 15,
-  'Medio (Lijado + Ensamblado)': 40,
-  'Complejo (Lijado + Pintura)': 75,
+const DISENO_LEGACY = {
+  'Chorrada - En Slicer': 'Básica (slicer)',
+  "Fácil - Fusión 30'": 'Media (Fusion <1h)',
+  "Medio - Fusión 60'": 'Media (Fusion <1h)',
+  'Avanzado - AI + Remesh': 'Alta (Fusion >1h / Artístico)',
+}
+
+const POSTPROC_LEGACY = {
+  No: 'Limpio',
+  'Sencillo (Lijado ligero)': 'Sencillo (lijado)',
+  'Medio (Lijado + Ensamblado)': 'Medio (lijado + ensamblado)',
+  'Complejo (Lijado + Pintura)': 'Avanzado (+ pintura)',
+}
+
+/* Un pedido antiguo con soportes marcados sube de tramo de post-procesado:
+ * los soportes ya no son un campo aparte, forman parte del tramo. */
+const SOPORTES_A_POSTPROC = {
+  'Pocos / Baja dificultad': 'Sencillo (lijado)',
+  'Muchos / Elevada dificultad': 'Medio (lijado + ensamblado)',
+}
+
+const POSTPROC_ORDEN = Object.keys(POSTPROCESADO)
+
+/** Fusiona las etiquetas antiguas de soportes y post-procesado en un tramo. */
+export function migratePostprocesado(postprocLabel, soportesLabel) {
+  const base = POSTPROCESADO[postprocLabel] !== undefined
+    ? postprocLabel
+    : (POSTPROC_LEGACY[postprocLabel] || 'Limpio')
+  const porSoportes = SOPORTES_A_POSTPROC[soportesLabel]
+  if (!porSoportes) return base
+  // Se queda el más caro de los dos: el trabajo de soportes ya está incluido.
+  return POSTPROC_ORDEN.indexOf(porSoportes) > POSTPROC_ORDEN.indexOf(base) ? porSoportes : base
+}
+
+/**
+ * Opciones de mano de obra listas para un desplegable, con el importe ya
+ * valorado al coste/hora vigente. Única fuente de verdad para la interfaz:
+ * si cambia la tabla de tarifas, los desplegables cambian solos.
+ */
+export function laborOptions(gconfig) {
+  const laborH = Number(gconfig?.labor_cost_h || 0)
+  const build = (table, descs) => Object.entries(table).map(([value, minutes]) => ({
+    value,
+    label: value,
+    desc: descs[value] || '',
+    minutes,
+    eur: (minutes / 60) * laborH,
+    custom: value === DISENO_A_MEDIDA,
+  }))
+  return {
+    diseno: build(DISENO_MODELADO, DISENO_MODELADO_DESC),
+    postproc: build(POSTPROCESADO, POSTPROCESADO_DESC),
+  }
+}
+
+/** Fusiona la antigua casilla "Búsqueda de modelos" en el tramo de diseño. */
+export function migrateDiseno(disenoLabel, busquedaLabel) {
+  if (DISENO_MODELADO[disenoLabel] !== undefined) {
+    return disenoLabel === 'No necesario' && busquedaLabel === 'Sí'
+      ? 'Búsqueda de modelos'
+      : disenoLabel
+  }
+  const mapped = DISENO_LEGACY[disenoLabel]
+  if (mapped) return mapped
+  return busquedaLabel === 'Sí' ? 'Búsqueda de modelos' : 'No necesario'
 }
 
 export const PROBABILIDAD_ERROR = {
@@ -84,7 +193,8 @@ export function roundMoney(value) {
 
 function roundUpToNickel(value) {
   const amount = Math.max(0, Number(value || 0))
-  return Math.ceil((amount + Number.EPSILON) / 0.05) * 0.05
+  // Redondeo a céntimo tras el múltiplo de 0,05: evita colas de coma flotante
+  return Math.round(Math.ceil((amount + Number.EPSILON) / 0.05) * 0.05 * 100) / 100
 }
 
 /* ── Default data ──────────────────────────────────────────────────────── */
@@ -109,9 +219,9 @@ export function createDefaultData() {
       { name: 'TPU', price_per_kg: 21 },
     ],
     filament_stock: [
-      { material: 'PLA', color: 'Negro', remaining_g: 1000, buy_threshold_g: 150 },
-      { material: 'PLA', color: 'Blanco', remaining_g: 1000, buy_threshold_g: 150 },
-      { material: 'PETG', color: 'Transparente', remaining_g: 1000, buy_threshold_g: 150 },
+      { material: 'PLA', color: 'Negro', used_g: 0 },
+      { material: 'PLA', color: 'Blanco', used_g: 0 },
+      { material: 'PETG', color: 'Transparente', used_g: 0 },
     ],
     global_config: {
       energy_cost_kwh: 0.24,
@@ -123,6 +233,20 @@ export function createDefaultData() {
       stripe_cancel_url: 'https://example.com/pago-cancelado',
       pdf_default_path: '',
       brand_color: '#3b82f6',
+      // PDF branding (client quote). Empty values fall back to the
+      // per-business preset in electron-main/main.js (resolveBranding).
+      pdf_show_logo: true,
+      pdf_logo_path: '',
+      pdf_primary_color: '',
+      pdf_header_style: '',
+      pdf_company_legal: '',
+      pdf_tagline: '',
+      pdf_contact_email: '',
+      pdf_contact_phone: '',
+      pdf_contact_web: '',
+      pdf_contact_address: '',
+      pdf_conditions: '',
+      pdf_footer_note: '',
       email_enabled: false,
       email_from: '',
       email_app_password: '',
@@ -145,16 +269,16 @@ export function createDefaultData() {
       peso_g: '50',
       tiempo_h: '1',
       diseno_modelado: 'No necesario',
-      busqueda_modelos: 'No',
-      eliminacion_soportes: 'No',
+      diseno_horas: 0,
       deterioro_impresora: 'Autofinanciación',
-      postprocesado: 'No',
+      postprocesado: 'Limpio',
       probabilidad_error: 'Baja (25%)',
       markup: 'Normal (230%)',
       urgencia_nivel: 'Normal',
       gasto_misc: 0,
     },
     orders: [],
+    purge_config: { colors: [], values: [], active_by_printer: {} },
   }
 }
 
@@ -181,7 +305,7 @@ function paymentStatusFromOrder(order) {
   return 'Parcial'
 }
 
-function refreshOrderPaymentFields(order) {
+export function refreshOrderPaymentFields(order) {
   order.precio_final = roundMoney(order.precio_final || 0)
   order.importe_pagado = roundMoney(order.importe_pagado || 0)
   order.importe_pendiente = roundMoney(Math.max(0, order.precio_final - order.importe_pagado))
@@ -221,10 +345,9 @@ function normalizeOrder(input) {
     is_multimaterial: !!input?.is_multimaterial,
     material_breakdown: Array.isArray(input?.material_breakdown) ? input.material_breakdown : [],
     material_contabilizado: !!input?.material_contabilizado,
-    diseno_modelado: String(input?.diseno_modelado || 'No necesario'),
-    busqueda_modelos: String(input?.busqueda_modelos || 'No'),
-    eliminacion_soportes: String(input?.eliminacion_soportes || 'No'),
-    postprocesado_label: String(input?.postprocesado_label || 'No'),
+    diseno_modelado: migrateDiseno(input?.diseno_modelado, input?.busqueda_modelos),
+    diseno_horas: Math.max(0, Number(input?.diseno_horas) || 0),
+    postprocesado_label: migratePostprocesado(input?.postprocesado_label, input?.eliminacion_soportes),
     probabilidad_error_label: String(input?.probabilidad_error_label || 'Baja'),
     markup_label: String(input?.markup_label || 'Normal (230%)'),
     is_shared: !!input?.is_shared,
@@ -237,6 +360,9 @@ function normalizeOrder(input) {
     imagen_path: String(input?.imagen_path || ''),
     archived: !!input?.archived,
     gasto_misc: roundMoney(input?.gasto_misc || 0),
+    accepted_at: String(input?.accepted_at || ''),
+    last_status_update: String(input?.last_status_update || ''),
+    notif_snooze_until: String(input?.notif_snooze_until || ''),
     payment_history: Array.isArray(input?.payment_history)
       ? input.payment_history.map((p) => ({
           id: String(p?.id || generateId()),
@@ -248,6 +374,9 @@ function normalizeOrder(input) {
         }))
       : [],
   }
+  // Campos fusionados en el tarifario actual: ya viven dentro de los dos tramos.
+  delete order.busqueda_modelos
+  delete order.eliminacion_soportes
   return refreshOrderPaymentFields(order)
 }
 
@@ -260,11 +389,25 @@ export function normalizeData(raw) {
   if (!Array.isArray(data.printers) || data.printers.length === 0) data.printers = defaults.printers
   if (!Array.isArray(data.filament_types) || data.filament_types.length === 0) data.filament_types = defaults.filament_types
   if (!Array.isArray(data.filament_stock) || data.filament_stock.length === 0) data.filament_stock = defaults.filament_stock
+  // El inventario ya no lleva stock restante ni umbral de compra: solo cuánto
+  // se ha gastado de cada color. Los campos antiguos se descartan al cargar.
+  data.filament_stock = data.filament_stock.map((item) => ({
+    material: String(item?.material || ''),
+    color: String(item?.color || ''),
+    ...(item?.color_hex ? { color_hex: String(item.color_hex) } : {}),
+    // Gramos que no salen de ningún pedido: purgas, fallos, bobina estropeada.
+    ajuste_g: Math.max(0, Number(item?.ajuste_g) || 0),
+  }))
   if (!Array.isArray(data.orders)) data.orders = []
   data.orders = data.orders.map((order) => normalizeOrder(order))
 
   data.global_config = { ...defaults.global_config, ...(data.global_config || {}) }
   data.calc_state = { ...defaults.calc_state, ...(data.calc_state || {}) }
+
+  if (!data.purge_config || typeof data.purge_config !== 'object') data.purge_config = { colors: [], values: [], active_by_printer: {} }
+  if (!Array.isArray(data.purge_config.colors)) data.purge_config.colors = []
+  if (!Array.isArray(data.purge_config.values)) data.purge_config.values = []
+  if (!data.purge_config.active_by_printer || typeof data.purge_config.active_by_printer !== 'object') data.purge_config.active_by_printer = {}
 
   if (data.calc_state.fecha) data.calc_state.fecha = normalizeDate(data.calc_state.fecha)
   data.calc_state.empresa = data.calc_state.empresa || '3DCC'
@@ -277,6 +420,14 @@ export function normalizeData(raw) {
     ? data.calc_state.urgencia_nivel
     : 'Normal'
 
+  // Tarifario actual: dos tramos. Un calc_state guardado con las etiquetas
+  // antiguas se pliega aquí para que el formulario nunca abra en un valor huérfano.
+  data.calc_state.diseno_modelado = migrateDiseno(data.calc_state.diseno_modelado, data.calc_state.busqueda_modelos)
+  data.calc_state.postprocesado = migratePostprocesado(data.calc_state.postprocesado, data.calc_state.eliminacion_soportes)
+  data.calc_state.diseno_horas = Math.max(0, Number(data.calc_state.diseno_horas) || 0)
+  delete data.calc_state.busqueda_modelos
+  delete data.calc_state.eliminacion_soportes
+
   return data
 }
 
@@ -288,21 +439,27 @@ function getDepreciationPerHour(printer) {
   return (Number(printer.price_eur || 0) + Number(printer.service_costs_life_eur || 0)) / hours
 }
 
-function calculateCost({ peso_g, horas, filament_price_per_kg, printer, gconfig, diseno_str, busqueda_str, soportes_str, postproc_str }) {
+function calculateCost({ peso_g, horas, filament_price_per_kg, printer, gconfig, diseno_str, diseno_horas, postproc_str, cantidad }) {
+  const laborH = Number(gconfig.labor_cost_h || 0)
+  const unidades = Math.max(1, Math.floor(Number(cantidad) || 1))
+
   const filamento = (peso_g * filament_price_per_kg) / 1000
   const electricidad = horas * Number(printer.energy_consumption_kwh || 0) * Number(gconfig.energy_cost_kwh || 0)
-  const diseno = (DISENO_MODELADO[diseno_str] || 0) * Number(gconfig.labor_cost_h || 0)
-  const busqueda = (BUSQUEDA_MODELOS[busqueda_str] || 0) * Number(gconfig.labor_cost_h || 0)
-  const soportes = ((ELIMINACION_SOPORTES[soportes_str] || 0) / 60) * Number(gconfig.labor_cost_h || 0)
   const deterioro = horas * getDepreciationPerHour(printer)
-  const postproc = ((POSTPROCESADO[postproc_str] || 0) / 60) * Number(gconfig.labor_cost_h || 0)
+
+  // Diseño: se cobra una sola vez por pedido, se impriman 1 o 50 piezas.
+  const disenoMin = diseno_str === DISENO_A_MEDIDA
+    ? Math.max(0, Number(diseno_horas) || 0) * 60
+    : (DISENO_MODELADO[diseno_str] || 0)
+  const diseno = (disenoMin / 60) * laborH
+
+  // Post-procesado: trabajo manual pieza a pieza, escala con la cantidad.
+  const postproc = ((POSTPROCESADO[postproc_str] || 0) / 60) * laborH * unidades
 
   return {
     filamento: round4(filamento),
     electricidad: round4(electricidad),
     diseno_modelado: round4(diseno),
-    busqueda_modelos: round4(busqueda),
-    eliminacion_soportes: round4(soportes),
     deterioro_impresora: round4(deterioro),
     postprocesado: round4(postproc),
   }
@@ -313,7 +470,7 @@ function subtotalAfectableError(bd) {
 }
 
 function subtotalNoAfectableError(bd) {
-  return bd.diseno_modelado + bd.busqueda_modelos + bd.eliminacion_soportes + bd.postprocesado
+  return Number(bd.diseno_modelado || 0) + Number(bd.postprocesado || 0)
 }
 
 function subtotal(bd) {
@@ -352,11 +509,9 @@ export function costAsDict(bd) {
   return {
     Filamento: bd.filamento,
     Electricidad: bd.electricidad,
-    'Diseño & Modelado': bd.diseno_modelado,
-    'Búsqueda modelos': bd.busqueda_modelos,
-    'Elim. soportes': bd.eliminacion_soportes,
     'Deterioro imp.': bd.deterioro_impresora,
-    Postprocesado: bd.postprocesado,
+    'Diseño': bd.diseno_modelado,
+    'Post-procesado': bd.postprocesado,
     ...(bd.gasto_misc > 0 ? { 'Extras / Misc.': bd.gasto_misc } : {}),
   }
 }
@@ -378,11 +533,10 @@ export function updateCalcState(payload, info) {
     peso_g: String(source.peso_g ?? ''),
     tiempo_h: String(source.tiempo_h ?? ''),
     cantidad: Math.max(1, Math.floor(Number(source.cantidad) || 1)),
-    diseno_modelado: source.diseno_modelado || 'No necesario',
-    busqueda_modelos: source.busqueda_modelos || 'No',
-    eliminacion_soportes: source.eliminacion_soportes || 'No',
+    diseno_modelado: migrateDiseno(source.diseno_modelado, source.busqueda_modelos),
+    diseno_horas: Math.max(0, Number(source.diseno_horas) || 0),
     deterioro_impresora: source.deterioro_impresora || 'Autofinanciación',
-    postprocesado: source.postprocesado || 'No',
+    postprocesado: migratePostprocesado(source.postprocesado, source.eliminacion_soportes),
     probabilidad_error: source.probabilidad_error || 'Baja',
     markup: source.markup || 'Normal (230%)',
     urgencia_nivel: source.urgencia_nivel || 'Normal',
@@ -410,7 +564,12 @@ export function calculateBudget(data, payload) {
     throw new Error('Peso y horas deben ser numéricos.')
   }
 
-  const printer = data.printers.find((p) => p.name === payload.impresora)
+  let printer = data.printers.find((p) => p.name === payload.impresora)
+  // Impresoras compartidas: si no es propia, buscar entre las del socio
+  // (el caller las adjunta en payload.partner_printers para pedidos compartidos)
+  if (!printer && Array.isArray(payload.partner_printers)) {
+    printer = payload.partner_printers.find((p) => p && p.name === payload.impresora)
+  }
   if (!printer) throw new Error('Selecciona una impresora.')
 
   const isMulti = !!payload.is_multimaterial
@@ -463,15 +622,24 @@ export function calculateBudget(data, payload) {
     ? Number(PROBABILIDAD_ERROR[payloadProbErrorKey])
     : (Number.isFinite(payloadProbErrorNum) ? payloadProbErrorNum : Number(PROBABILIDAD_ERROR['Baja (25%)'] || 0.25))
   const urgenciaRate = URGENCIA[payload.urgencia_nivel] ?? 0
+  const cantidad = Math.max(1, Math.floor(Number(payload.cantidad) || 1))
+
+  // Los payloads antiguos traían Búsqueda y Soportes como campos aparte;
+  // se pliegan sobre los dos tramos actuales antes de valorar nada.
+  const disenoLabel = migrateDiseno(payload.diseno_modelado, payload.busqueda_modelos)
+  const postprocLabel = migratePostprocesado(payload.postprocesado, payload.eliminacion_soportes)
+  const disenoHoras = disenoLabel === DISENO_A_MEDIDA
+    ? Math.max(0, Number(payload.diseno_horas) || 0)
+    : 0
 
   const bd = calculateCost({
     peso_g: peso, horas,
     filament_price_per_kg: effectivePricePerKg,
     printer, gconfig,
-    diseno_str: payload.diseno_modelado,
-    busqueda_str: payload.busqueda_modelos,
-    soportes_str: payload.eliminacion_soportes,
-    postproc_str: payload.postprocesado,
+    diseno_str: disenoLabel,
+    diseno_horas: disenoHoras,
+    postproc_str: postprocLabel,
+    cantidad,
   })
 
   if (filamentCostOverride !== null) bd.filamento = filamentCostOverride
@@ -513,11 +681,10 @@ export function calculateBudget(data, payload) {
     precio_final: precio,
     precio_minimo: Number(gconfig.precio_minimo || 3),
     precio_minimo_aplicado: precioMinAplicado,
-    diseno: payload.diseno_modelado,
-    busqueda: payload.busqueda_modelos,
-    soportes: payload.eliminacion_soportes,
+    diseno: disenoLabel,
+    diseno_horas: disenoHoras,
     deterioro: payload.deterioro_impresora,
-    postproc: payload.postprocesado,
+    postproc: postprocLabel,
     prob_error: payload.probabilidad_error,
     markup_label: payload.markup || 'Normal (230%)',
     coste_bruto_impresion: subtotalAfectableError(bd),
@@ -525,8 +692,8 @@ export function calculateBudget(data, payload) {
     stripe_payment_url: '',
     stripe_session_id: '',
     importe_pagado: 0,
-    cantidad: Math.max(1, Math.floor(Number(payload.cantidad) || 1)),
-    precio_unitario: roundMoney(precio / Math.max(1, Math.floor(Number(payload.cantidad) || 1))),
+    cantidad,
+    precio_unitario: roundMoney(precio / cantidad),
     is_shared: !!payload.is_shared,
     shared_split: payload.is_shared ? {
       '3DCC': Number(payload.shared_percent_3dcc ?? 50),
@@ -570,9 +737,8 @@ export function saveOrderFromResult(data, resultInfo) {
     material_breakdown: Array.isArray(info.material_breakdown) ? info.material_breakdown : [],
     material_contabilizado: false,
     diseno_modelado: info.diseno || 'No necesario',
-    busqueda_modelos: info.busqueda || 'No',
-    eliminacion_soportes: info.soportes || 'No',
-    postprocesado_label: info.postproc || 'No',
+    diseno_horas: Number(info.diseno_horas || 0),
+    postprocesado_label: info.postproc || 'Limpio',
     probabilidad_error_label: info.prob_error || 'Baja',
     markup_label: info.markup_label || 'Normal (230%)',
     is_shared: !!info.is_shared,
@@ -586,7 +752,7 @@ export function saveOrderFromResult(data, resultInfo) {
   return order
 }
 
-function findOrder(data, orderId) {
+export function findOrder(data, orderId) {
   const idx = data.orders.findIndex((o) => o.id === orderId)
   if (idx < 0) throw new Error('Pedido no encontrado.')
   return { idx, order: data.orders[idx] }
@@ -632,11 +798,10 @@ export function recalculateOrder(data, params) {
   order.gasto_misc = roundMoney(info.gasto_misc || 0)
 
   // Store cost-factor labels
-  order.diseno_modelado = payload.diseno_modelado || 'No necesario'
-  order.busqueda_modelos = payload.busqueda_modelos || 'No'
-  order.eliminacion_soportes = payload.eliminacion_soportes || 'No'
-  order.postprocesado_label = payload.postprocesado || 'No'
-  order.probabilidad_error_label = payload.probabilidad_error || 'Baja'
+  order.diseno_modelado = info.diseno || 'No necesario'
+  order.diseno_horas = Number(info.diseno_horas || 0)
+  order.postprocesado_label = info.postproc || 'Limpio'
+  order.probabilidad_error_label = payload.probabilidad_error || 'Baja (25%)'
   order.markup_label = payload.markup || 'Normal (230%)'
 
   // Shared order
@@ -667,7 +832,11 @@ export function recalculateOrder(data, params) {
   return { ok: true, order, result, oldPrice, newPrice, delta }
 }
 
-function consumeOrderMaterial(data, order, partnerStock) {
+/**
+ * Apunta el material que se lleva un pedido al aceptarlo. No hay stock que
+ * descontar: solo se acumula cuánto se ha gastado de cada color.
+ */
+function consumeOrderMaterial(data, order) {
   const lines = []
 
   if (order.is_multimaterial) {
@@ -689,78 +858,74 @@ function consumeOrderMaterial(data, order, partnerStock) {
     lines.push({ material, color, grams })
   }
 
-  // For shared orders, combine own + partner pools for deduction
-  const useSharedPool = !!order.is_shared && Array.isArray(partnerStock)
-
-  const lowStock = []
   for (const line of lines) {
-    let remaining = line.grams
-
-    // Try own stock first
-    let ownItem = data.filament_stock.find(
+    const existe = data.filament_stock.some(
       (s) => s.material === line.material && String(s.color || '').toLowerCase() === line.color.toLowerCase(),
     )
-    if (!ownItem) {
-      ownItem = { material: line.material, color: line.color, remaining_g: 0, buy_threshold_g: 150 }
-      data.filament_stock.push(ownItem)
-    }
-
-    const ownAvailable = Math.max(0, Number(ownItem.remaining_g || 0))
-
-    if (useSharedPool && ownAvailable < remaining) {
-      // Deduct as much as possible from own stock, rest from partner
-      const fromOwn = Math.min(ownAvailable, remaining)
-      ownItem.remaining_g = Math.round((ownAvailable - fromOwn) * 100) / 100
-      remaining -= fromOwn
-
-      // Now try partner stock
-      let partnerItem = partnerStock.find(
-        (s) => s.material === line.material && String(s.color || '').toLowerCase() === line.color.toLowerCase(),
-      )
-      if (!partnerItem) {
-        partnerItem = { material: line.material, color: line.color, remaining_g: 0, buy_threshold_g: 150 }
-        partnerStock.push(partnerItem)
-      }
-      partnerItem.remaining_g = Math.round((Number(partnerItem.remaining_g || 0) - remaining) * 100) / 100
-      remaining = 0
-
-      if (Number(partnerItem.remaining_g || 0) <= Number(partnerItem.buy_threshold_g || 0)) {
-        lowStock.push(`[Partner] ${partnerItem.material} (${partnerItem.color}): ${Number(partnerItem.remaining_g || 0).toFixed(2)} g`)
-      }
-    } else {
-      // All from own stock
-      ownItem.remaining_g = Math.round((Number(ownItem.remaining_g || 0) - remaining) * 100) / 100
-    }
-
-    if (Number(ownItem.remaining_g || 0) <= Number(ownItem.buy_threshold_g || 0)) {
-      lowStock.push(`${ownItem.material} (${ownItem.color}): ${Number(ownItem.remaining_g || 0).toFixed(2)} g`)
-    }
+    // Color usado por primera vez: entra en el catálogo para poder elegirlo.
+    if (!existe) data.filament_stock.push({ material: line.material, color: line.color, ajuste_g: 0 })
   }
 
   order.material_contabilizado = true
-  return lowStock
 }
 
-export function setOrderAccepted(data, orderId, partnerStock) {
+/* ── Gasto de material ──────────────────────────────────────────────────
+ * Se deriva del historial de pedidos en vez de llevar un contador. Así los
+ * pedidos antiguos y archivados cuentan solos, y editar o borrar un pedido
+ * corrige el total sin que nada se quede descuadrado. */
+
+function claveColor(material, color) {
+  return `${String(material || '').trim()}|${String(color || '').trim().toLowerCase()}`
+}
+
+/** Gramos gastados por color, sumando los pedidos ya contabilizados. */
+export function filamentUsageByColor(data) {
+  const uso = new Map()
+  const suma = (material, color, grams) => {
+    const g = Math.max(0, Number(grams) || 0)
+    if (!material || g <= 0) return
+    const k = claveColor(material, color || 'Negro')
+    uso.set(k, round4((uso.get(k) || 0) + g))
+  }
+
+  for (const order of data.orders || []) {
+    // Solo cuentan los pedidos cuyo material se dio por consumido al aceptarlos.
+    if (!order.material_contabilizado) continue
+    if (order.is_multimaterial && Array.isArray(order.material_breakdown) && order.material_breakdown.length) {
+      for (const linea of order.material_breakdown) suma(linea.material, linea.color, linea.grams)
+    } else {
+      suma(order.filamento, order.filamento_color, order.peso_g)
+    }
+  }
+  return uso
+}
+
+/** Gramos gastados de un color: lo del historial más el ajuste manual. */
+export function filamentSpendG(item, usage) {
+  const delHistorial = usage?.get(claveColor(item?.material, item?.color)) || 0
+  return round4(delHistorial + Math.max(0, Number(item?.ajuste_g) || 0))
+}
+
+/** Ese mismo gasto en euros, al precio por kilo vigente de su material. */
+export function filamentSpendEur(item, filamentTypes, usage) {
+  const tipo = (filamentTypes || []).find((f) => f.name === item?.material)
+  return roundMoney((filamentSpendG(item, usage) * Number(tipo?.price_per_kg || 0)) / 1000)
+}
+
+export function setOrderAccepted(data, orderId) {
   const { order } = findOrder(data, orderId)
   if (!(order.estado === 'Aceptado' && order.material_contabilizado)) {
-    const lowStock = order.material_contabilizado
-      ? []
-      : consumeOrderMaterial(data, order, partnerStock)
+    if (!order.material_contabilizado) consumeOrderMaterial(data, order)
     order.estado = 'Aceptado'
-    const result = { ok: true, lowStock }
-    // If shared and partner stock was used, signal back so it can be persisted
-    if (order.is_shared && Array.isArray(partnerStock)) {
-      result.partnerStockUsed = true
-      result.partnerStock = partnerStock
-    }
-    return result
+    order.accepted_at = order.accepted_at || new Date().toISOString()
+    order.last_status_update = new Date().toISOString()
   }
-  return { ok: true, lowStock: [] }
+  return { ok: true }
 }
 
 export function setOrderSent(data, orderId) {
   const { order } = findOrder(data, orderId)
+  if (order.estado !== 'Presupuesto enviado') order.last_status_update = new Date().toISOString()
   order.estado = 'Presupuesto enviado'
 }
 
@@ -777,11 +942,17 @@ export function updateOrder(data, params) {
   if (updates.cliente !== undefined) order.cliente = String(updates.cliente || '').trim()
   if (updates.cliente_email !== undefined) order.cliente_email = String(updates.cliente_email || '').trim()
   if (updates.descripcion !== undefined) order.descripcion = String(updates.descripcion || '').trim()
-  if (updates.estado !== undefined) order.estado = normalizeEstado(updates.estado)
+  if (updates.estado !== undefined) {
+    const nuevoEstado = normalizeEstado(updates.estado)
+    if (nuevoEstado !== order.estado) order.last_status_update = new Date().toISOString()
+    order.estado = nuevoEstado
+  }
+  if (updates.notif_snooze_until !== undefined) order.notif_snooze_until = String(updates.notif_snooze_until || '')
   if (updates.notes !== undefined) order.notes = String(updates.notes || '').trim()
   if (updates.payment_method !== undefined) order.payment_method = String(updates.payment_method || '').trim()
   if (updates.repeticiones_error !== undefined) order.repeticiones_error = Math.max(0, Math.floor(Number(updates.repeticiones_error) || 0))
   if (updates.imagen_path !== undefined) order.imagen_path = String(updates.imagen_path || '')
+  if (updates.archived !== undefined) order.archived = !!updates.archived
 
   if (updates.is_shared !== undefined) {
     order.is_shared = !!updates.is_shared
@@ -889,132 +1060,114 @@ export function getTickets(resultInfo) {
   const bd = resultInfo.breakdown
   const breakdownDict = resultInfo.breakdownDict || costAsDict(bd)
   const entries = Object.entries(breakdownDict).map(([name, val]) => ({ name, value: Number(val || 0) }))
-  
+
   const isBruto = (label) => ['Filamento', 'Electricidad', 'Deterioro imp.', 'Desgaste impresora'].includes(String(label || '').trim())
   const costeBruto = entries.filter((item) => isBruto(item.name)).reduce((acc, item) => acc + item.value, 0)
   const brutoVal = costeBruto
   const complementoVal = entries.filter((item) => !isBruto(item.name)).reduce((acc, item) => acc + item.value, 0)
-  
+
   const cantidad = Math.max(1, Math.floor(Number(info.cantidad) || 1))
   const precioTotal = Number(info.precio_final || 0)
   const precioUnitario = roundMoney(precioTotal / cantidad)
-  
+
   const errorRate = Number(info.error_rate || 0)
   const markup = Number(info.markup || 1)
   const markupVal = Math.max(0, costeBruto * (markup - 1))
   const errorVal = Math.max(0, costeBruto * errorRate)
   const recargoUrgencia = Number(info.recargo_urgencia || 0)
-  
+
   // Real Net Benefit
   const beneficioNeto = markupVal + errorVal + recargoUrgencia
 
   const fillRight = (text, len) => text.padEnd(len, ' ')
   const fillLeft = (text, len) => text.padStart(len, ' ')
 
-  const SEP  = '  ================================================'
-  const SEP2 = '  ------------------------------------------------'
-  const HDR  = '  ████████████████████████████████████████████████'
-
   const clienteLines = [
+    '┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓',
+    `┃  ${fillRight((info.empresa + ' · RESUMEN DE PEDIDO').toUpperCase(), 44)}  ┃`,
+    '┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛',
     '',
-    HDR,
-    `  ██  ${fillRight(info.empresa.toUpperCase(), 40)}  ██`,
-    `  ██  ${fillRight('PRESUPUESTO / RESUMEN DE PEDIDO', 40)}  ██`,
-    HDR,
+    `  CLIENTE:      ${info.cliente}`,
+    `  FECHA:        ${info.fecha}`,
+    `  PROYECTO:     ${info.descripcion}`,
     '',
-    SEP2,
-    `  CLIENTE  : ${info.cliente}`,
-    `  FECHA    : ${info.fecha}`,
-    `  PROYECTO : ${info.descripcion}`,
-    SEP2,
+    '  [ DETALLES TÉCNICOS ]',
+    `  • Material:   ${info.filamento} (${info.filamento_color || '-'})`,
+    `  • Peso est.:  ${info.peso} g`,
+    `  • Tiempo req: ${info.horas} h`,
+    `  • Urgencia:   ${info.urgencia_nivel}`,
     '',
-    '  DETALLES DEL TRABAJO',
-    `    Material  : ${info.filamento} — ${info.filamento_color || '-'}`,
-    `    Peso est. : ${info.peso} g`,
-    `    Tiempo    : ${info.horas} h`,
-    `    Urgencia  : ${info.urgencia_nivel}`,
+    '  [ PRESUPUESTO ]',
+    `  Precio unitario:       ${fillLeft(precioUnitario.toFixed(2), 7)} ${info.unit}`,
+    `  Cantidad:              ${fillLeft(cantidad.toString(), 7)} ud.`,
+    '  ────────────────────────────────────────────────',
+    `  TOTAL A ABONAR:        ${fillLeft(precioTotal.toFixed(2), 7)} ${info.unit}`,
+    '  ────────────────────────────────────────────────',
     '',
-    SEP,
-    '  PRESUPUESTO',
-    SEP,
-    `    Precio unitario  : ${fillLeft(precioUnitario.toFixed(2), 8)} ${info.unit}`,
-    `    Cantidad         : ${fillLeft(cantidad.toString(), 8)} ud.`,
-    SEP2,
-    `    TOTAL A ABONAR   : ${fillLeft(precioTotal.toFixed(2), 8)} ${info.unit}`,
-    SEP,
-    '',
-    '  CONDICIONES',
-    '    · Precio final cerrado, incluye todos los costes.',
-    '    · Plazo sujeto a cola de impresión y complejidad.',
-    '    · Se solicita 50% de anticipo para confirmar.',
-    '',
-    SEP2,
+    '  📝 TÉRMINOS Y CONDICIONES',
+    '  • El coste arriba reflejado es el precio final cerrado e',
+    '    incluye todos los gastos del proceso productivo.',
+    '  • Si no se ha acordado una entrega express, el tiempo final',
+    '    vendrá marcado por la cola de impresión y complejidad.',
+    '  • Se solicita un 50% por adelantado para confirmar el encargo.',
     '',
   ]
 
   const empresaLines = [
+    '┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓',
+    `┃  ${fillRight((info.empresa + ' · HOJA INTERNA DE TALLER').toUpperCase(), 44)}  ┃`,
+    '┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛',
     '',
-    HDR,
-    `  ██  ${fillRight(info.empresa.toUpperCase(), 40)}  ██`,
-    `  ██  ${fillRight('HOJA INTERNA DE TALLER', 40)}  ██`,
-    HDR,
+    `  CLIENTE:      ${info.cliente}`,
+    `  PROYECTO:     ${info.descripcion}`,
+    `  IMPRESORA:    ${info.impresora}`,
     '',
-    SEP2,
-    `  CLIENTE   : ${info.cliente}`,
-    `  PROYECTO  : ${info.descripcion}`,
-    `  IMPRESORA : ${info.impresora}`,
-    `  MATERIAL  : ${info.filamento} (${info.filamento_color || '-'}) — ${info.peso} g — ${info.horas} h`,
-    SEP2,
-    '',
-    `  DESGLOSE DE COSTES  (${cantidad} ud.)`,
-    '',
-    '  ── COSTE BRUTO (Materia Prima + Maquinaria) ──',
+    `  [ DESGLOSE DE COSTES (${cantidad} ud.) ]`,
   ]
 
+  // BRUTO
+  empresaLines.push('  ▼ Materia Prima y Maquinaria (Bruto)')
   entries.filter(i => isBruto(i.name)).forEach(item => {
-    empresaLines.push(`    ${fillRight(item.name, 22)} ${fillLeft(item.value.toFixed(2), 7)} ${info.unit}`)
+    empresaLines.push(`    • ${fillRight(item.name, 19)}: ${fillLeft(item.value.toFixed(2), 6)} ${info.unit}`)
   })
-  empresaLines.push(SEP2)
-  empresaLines.push(`    ${fillRight('SUBTOTAL BRUTO', 22)} ${fillLeft(brutoVal.toFixed(2), 7)} ${info.unit}`)
+  empresaLines.push(`    > SUBTOTAL BRUTO ........: ${fillLeft(brutoVal.toFixed(2), 6)} ${info.unit}`)
   empresaLines.push('')
 
+  // COMPLEMENTOS
   if (complementoVal > 0) {
-    empresaLines.push('  ── COMPLEMENTOS (Mano de Obra + Extras) ──')
+    empresaLines.push('  ▼ Mano de Obra y Tareas Extra')
     entries.filter(i => !isBruto(i.name)).forEach(item => {
-      empresaLines.push(`    ${fillRight(item.name, 22)} ${fillLeft(item.value.toFixed(2), 7)} ${info.unit}`)
+      empresaLines.push(`    • ${fillRight(item.name, 19)}: ${fillLeft(item.value.toFixed(2), 6)} ${info.unit}`)
     })
-    empresaLines.push(SEP2)
-    empresaLines.push(`    ${fillRight('SUBTOTAL COMPLEMENTOS', 22)} ${fillLeft(complementoVal.toFixed(2), 7)} ${info.unit}`)
+    empresaLines.push(`    > SUBTOTAL M.OBRA .......: ${fillLeft(complementoVal.toFixed(2), 6)} ${info.unit}`)
     empresaLines.push('')
   }
 
-  empresaLines.push('  ── MÁRGENES Y BENEFICIO ──')
-  empresaLines.push(`    ${fillRight(`Markup (×${markup.toFixed(1)})`, 22)} +${fillLeft(markupVal.toFixed(2), 6)} ${info.unit}`)
+  // MARGEN
+  empresaLines.push('  ▼ Márgenes y Beneficio')
+  empresaLines.push(`    • Beneficio Base (x${markup.toFixed(1)}) : +${fillLeft(markupVal.toFixed(2), 5)} ${info.unit}`)
   if (errorVal > 0) {
-    empresaLines.push(`    ${fillRight(`Fondo Error (${info.prob_error})`, 22)} +${fillLeft(errorVal.toFixed(2), 6)} ${info.unit}`)
+    empresaLines.push(`    • Fondo Error (${info.prob_error.substring(0, 6)})   : +${fillLeft(errorVal.toFixed(2), 5)} ${info.unit}`)
   }
   if (recargoUrgencia > 0) {
-    empresaLines.push(`    ${fillRight('Plus Urgencia', 22)} +${fillLeft(recargoUrgencia.toFixed(2), 6)} ${info.unit}`)
+    empresaLines.push(`    • Plus Urgencia         : +${fillLeft(recargoUrgencia.toFixed(2), 5)} ${info.unit}`)
   }
-  empresaLines.push(SEP2)
-  empresaLines.push(`    ${fillRight('BENEFICIO NETO', 22)} ${fillLeft(beneficioNeto.toFixed(2), 7)} ${info.unit}`)
+  empresaLines.push(`    > BENEFICIO NETO ........: ${fillLeft(beneficioNeto.toFixed(2), 6)} ${info.unit}`)
   empresaLines.push('')
 
   if (info.precio_minimo_aplicado) {
-    empresaLines.push(`  * Tarifa mínima aplicada: ${Number(info.precio_minimo || 0).toFixed(2)} ${info.unit}`)
-    empresaLines.push('')
+    empresaLines.push(`  (Aviso: Se aplicó tarifa mínima de ${Number(info.precio_minimo || 0).toFixed(2)} ${info.unit})`)
   }
 
-  empresaLines.push(SEP)
-  empresaLines.push(`    ${fillRight('PRECIO UNITARIO', 22)} ${fillLeft(precioUnitario.toFixed(2), 7)} ${info.unit}`)
-  empresaLines.push(`    ${fillRight('CANTIDAD', 22)} ${fillLeft(cantidad.toString(), 7)} ud.`)
-  empresaLines.push(SEP2)
-  empresaLines.push(`    ${fillRight('PVP FINAL', 22)} ${fillLeft(precioTotal.toFixed(2), 7)} ${info.unit}`)
-  empresaLines.push(SEP)
-  empresaLines.push('')
-  empresaLines.push(`  Opciones: Dis=${info.diseno} | Busq=${info.busqueda} | Sop=${info.soportes}`)
-  empresaLines.push(`            Post=${info.postproc} | Err=${info.prob_error} | Urg=${info.urgencia_nivel}`)
-  empresaLines.push('')
+  empresaLines.push(
+    '  ────────────────────────────────────────────────',
+    `  PRECIO UNIDAD:     ${fillLeft(precioUnitario.toFixed(2), 7)} ${info.unit}`,
+    `  CANTIDAD TOTAL:    ${fillLeft(cantidad.toString(), 7)} ud.`,
+    `  PVP VENTA FINAL:   ${fillLeft(precioTotal.toFixed(2), 7)} ${info.unit}`,
+    '  ────────────────────────────────────────────────',
+    '',
+    `  [!] Opciones Elegidas: Dis=${info.diseno} | Busq=${info.busqueda} | Sop=${info.soportes} | Det=${info.deterioro} | Post=${info.postproc} | Err=${info.prob_error} | Urg=${info.urgencia_nivel}`
+  )
 
   return { cliente: clienteLines.join('\n'), empresa: empresaLines.join('\n') }
 }

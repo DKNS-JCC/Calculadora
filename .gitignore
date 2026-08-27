@@ -46,3 +46,10 @@ config.json
 
 # Arduino sketches with embedded credentials
 *.ino
+
+# Herramientas del agente (skills instaladas, no forman parte de la app)
+/.claude/skills/
+/skills-lock.json
+
+# Temporales del CLI de Supabase
+/supabase/.temp/

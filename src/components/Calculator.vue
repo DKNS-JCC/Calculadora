@@ -1,5 +1,5 @@
 <script setup>
-import { ref, reactive, computed, onMounted, watch, onUnmounted } from 'vue'
+import { ref, reactive, computed, onMounted, watch, onUnmounted, nextTick } from 'vue'
 import { z } from 'zod'
 import { store } from '../store'
 import { api } from '../platform'
@@ -16,10 +16,11 @@ import Chart from 'primevue/chart'
 import Panel from 'primevue/panel'
 import Slider from 'primevue/slider'
 import DatePicker from 'primevue/datepicker'
-import AutoComplete from 'primevue/autocomplete'
 import ChartCard from './ChartCard.vue'
 import EmailNotifyDialog from './EmailNotifyDialog.vue'
 import { useEmailConfirm } from '../composables/useEmailConfirm'
+import { laborOptions, DISENO_A_MEDIDA, MARKUP } from '../shared/backend.mjs'
+import { useIsHandheld } from '../composables/useMediaQuery'
 
 const { state: emailConfirmState, ask: askEmailConfirm, answer: answerEmailConfirm } = useEmailConfirm()
 const onEmailDialogSend = () => answerEmailConfirm('send')
@@ -34,52 +35,35 @@ function errorRateToRepString(rate) {
 }
 
 const OPTIONS = {
-    diseno: ['No necesario', 'Chorrada - En Slicer', "Fácil - Fusión 30'", "Medio - Fusión 60'", 'Avanzado - AI + Remesh'],
-    busqueda: ['No', 'Sí'],
-    soportes: ['No', 'Pocos / Baja dificultad', 'Muchos / Elevada dificultad'],
-    postproc: ['No', 'Sencillo (Lijado ligero)', 'Medio (Lijado + Ensamblado)', 'Complejo (Lijado + Pintura)'],
     probError: [
-        { label: 'Exenta (0%)', value: 'Exenta (0%)' },
-        { label: 'Mínima (10%)', value: 'Mínima (10%)' },
         { label: 'Baja (25%)', value: 'Baja (25%)' },
         { label: 'Media (50%)', value: 'Media (50%)' },
         { label: 'Alta (100% ≈ 1 fallo)', value: 'Alta (100%)' },
         { label: 'Muy Alta (150%)', value: 'Muy Alta (150%)' },
         { label: 'Crítica (200% ≈ 2 fallos)', value: 'Crítica (200%)' },
     ],
-    markup: ['Normal (230%)'],
     urgencia: ['Normal', 'Urgente'],
-    estabilidad: [
-        { label: 'Alta — Base ancha y sólida', value: 0 },
-        { label: 'Media — Esbelto / Contacto medio', value: 0.5 },
-        { label: 'Baja — Inestable / Mínimo contacto', value: 1.5 },
+    // Factores binarios del cuestionario de riesgo (0 = favorable, 1 = adverso)
+    geometria: [
+        { label: 'Base grande', value: 0 },
+        { label: 'Base reducida', value: 1 },
     ],
-    materialDificultad: [
-        { label: 'Fácil — PLA, PETG, TPU', value: 0 },
-        { label: 'Medio — ASA, ABS, Madera', value: 0.5 },
-        { label: 'Difícil — Nylon, PC, Glow', value: 1.5 },
+    dificultadTecnica: [
+        { label: 'Sencilla (PLA, PETG o similares)', value: 0 },
+        { label: 'Compleja (resto de materiales)', value: 1 },
     ],
-    esMulticolor: [
-        { label: 'No — Monocolor / Un solo material', value: 0 },
-        { label: 'Sí — Cambio de color / AMS / MMU', value: 1.5 },
+    duracionIndividual: [
+        { label: 'Reducida (<5 horas)', value: 0 },
+        { label: 'Elevada (>5 horas)', value: 1 },
     ],
-    puestaAPunto: [
-        { label: 'Probado — Modelo ya impreso', value: 0 },
-        { label: 'Nuevo — Primer intento / Ajuste', value: 0.5 },
-        { label: 'Complejo — Requiere I+D / Fallos probables', value: 1.5 },
+    idOptimizacion: [
+        { label: 'Modelo fiable', value: 0 },
+        { label: 'Requiere optimización', value: 1 },
     ],
 }
 
-const MATERIAL_RISK_MAP = {
-    'PLA': 0,
-    'PETG': 0.1,
-    'TPU': 0.3,
-    'ASA': 0.5,
-    'ABS': 0.6,
-    'PLA SILK/MARBLE': 0.2,
-    'NYLON': 1.0,
-    'CARBON': 1.2
-}
+// Materiales considerados "sencillos" para la dificultad técnica
+const MATERIALES_SENCILLOS = ['PLA', 'PETG', 'PLA SILK/MARBLE']
 
 /* ── Zod Validation ── */
 const calcSchema = z.object({
@@ -95,6 +79,8 @@ const calcSchema = z.object({
 
 const toast = useToast()
 const confirm = useConfirm()
+const isHandheld = useIsHandheld()
+const resultsAnchor = ref(null)
 const errors = ref({})
 
 /* ── Date picker helper ── */
@@ -109,23 +95,6 @@ const formFechaDate = computed({
         form.fecha = `${val.getFullYear()}-${String(val.getMonth() + 1).padStart(2, '0')}-${String(val.getDate()).padStart(2, '0')}`
     }
 })
-
-/* ── Client autocomplete ── */
-const clientSuggestions = ref([])
-const clients = computed(() => store.appData.clients || [])
-const filterClients = (e) => {
-    const q = (e.query || '').toLowerCase()
-    const all = clients.value.map(c => c.name)
-    clientSuggestions.value = q ? all.filter(c => c.toLowerCase().includes(q)) : all
-}
-
-const onClientSelect = (e) => {
-    const client = clients.value.find(c => c.name === e.value)
-    if (client) {
-        if (client.email) form.cliente_email = client.email
-        if (client.default_discount > 0) form.markup_label = `Descuento (${client.default_discount}%)`
-    }
-}
 
 
 const findLastEmailForClient = (name) => {
@@ -169,12 +138,11 @@ const form = reactive({
     is_shared: false,
     shared_percent_3dcc: 50,
     shared_percent_silab3d: 50,
-    diseno_modelado: OPTIONS.diseno[0],
-    busqueda_modelos: OPTIONS.busqueda[0],
-    eliminacion_soportes: OPTIONS.soportes[0],
-    postprocesado: OPTIONS.postproc[0],
+    diseno_modelado: 'No necesario',
+    diseno_horas: 1,
+    postprocesado: 'Limpio',
     probabilidad_error: OPTIONS.probError[0].value,
-    markup: OPTIONS.markup[0],
+    markup: Object.keys(MARKUP)[0],
     urgencia_nivel: OPTIONS.urgencia[0],
     gasto_misc: 0,
 })
@@ -201,39 +169,24 @@ const normalizeHex = (value) => {
 }
 
 const riskDialog = ref(false)
-const indiceError = reactive({ estabilidad: 0, material: 0, puesta: 0, multicolor: 0 })
+const indiceError = reactive({ geometria: 0, dificultad: 0, duracion: 0, id: 0 })
 
 const openRiskDialog = () => {
-    // Sincronizar con el estado actual de multimaterial del formulario
-    indiceError.multicolor = form.is_multimaterial ? 1.5 : 0
+    // Autorrellenar dificultad técnica desde el material y duración desde el tiempo
+    const mat = String(form.filamento_tipo || '').toUpperCase().trim()
+    indiceError.dificultad = MATERIALES_SENCILLOS.some(m => mat === m || mat.startsWith(m)) ? 0 : (mat ? 1 : 0)
+    indiceError.duracion = Number(form.tiempo_h || 0) > 5 ? 1 : 0
     riskDialog.value = true
 }
 
+// Nº de factores adversos (0-4) → escalón de probabilidad (25-200%)
+const NIVELES_ERROR = ['Baja (25%)', 'Media (50%)', 'Alta (100%)', 'Muy Alta (150%)', 'Crítica (200%)']
 const indiceErrorSugerido = computed(() => {
-    let score = 0
-
-    // 1. Material Factor (Base risk from selection)
-    const matBase = String(form.filamento_tipo || '').toUpperCase()
-    for (const [key, val] of Object.entries(MATERIAL_RISK_MAP)) {
-        if (matBase.includes(key)) { score = val; break }
-    }
-
-    // 2. Time Exposure
-    score += (Number(form.tiempo_h || 0) / 15) * 0.5
-
-    // 3. Questionnaire Subjective Factors (4 questions)
-    score += (Number(indiceError.estabilidad) || 0)
-    score += (Number(indiceError.material) || 0)
-    score += (Number(indiceError.puesta) || 0)
-    score += (Number(indiceError.multicolor) || 0)
-
-    if (score <= 0.2) return 'Exenta (0%)'
-    if (score <= 0.6) return 'Mínima (10%)'
-    if (score <= 1.2) return 'Baja (25%)'
-    if (score <= 2.2) return 'Media (50%)'
-    if (score <= 3.5) return 'Alta (100%)'
-    if (score <= 5.0) return 'Muy Alta (150%)'
-    return 'Crítica (200%)'
+    const adversos = (Number(indiceError.geometria) || 0)
+        + (Number(indiceError.dificultad) || 0)
+        + (Number(indiceError.duracion) || 0)
+        + (Number(indiceError.id) || 0)
+    return NIVELES_ERROR[Math.min(adversos, NIVELES_ERROR.length - 1)]
 })
 const applyIndiceError = () => {
     form.probabilidad_error = indiceErrorSugerido.value
@@ -269,7 +222,22 @@ const onMixMaterialChange = (idx) => {
     }
 }
 
-const printerOptions = computed(() => store.appData.printers.map(p => p.name))
+const printerOptions = computed(() => {
+    const options = store.appData.printers.map(p => ({ label: p.name, value: p.name }))
+    // Impresoras compartidas: en pedidos compartidos se puede imprimir en las del socio
+    if (form.is_shared && store.partnerInventory?.printers?.length) {
+        const ownNames = new Set(store.appData.printers.map(p => p.name))
+        const partnerName = store.partnerInventory.partner || 'Socio'
+        for (const p of store.partnerInventory.printers) {
+            if (p?.name && !ownNames.has(p.name)) options.push({ label: `${p.name} · ${partnerName}`, value: p.name })
+        }
+    }
+    return options
+})
+
+const partnerPrintersPayload = () => form.is_shared
+    ? JSON.parse(JSON.stringify(store.partnerInventory?.printers || []))
+    : []
 const filamentOptions = computed(() => store.appData.filament_types.map(f => f.name))
 
 const mixLines = reactive([
@@ -320,6 +288,28 @@ const filamentPrice = computed(() => {
     const f = store.appData.filament_types.find(ft => ft.name === form.filamento_tipo)
     return f ? `${f.price_per_kg} ${unit.value}/kg` : ''
 })
+
+/* ── Tarifas de mano de obra ──
+ * Los tramos y sus importes salen de backend.mjs valorados al coste/hora
+ * vigente, así que un cambio de tarifa se refleja aquí sin tocar la vista. */
+const tarifas = computed(() => laborOptions(store.appData.global_config))
+const disenoOptions = computed(() => tarifas.value.diseno)
+const postprocOptions = computed(() => tarifas.value.postproc)
+const esDisenoAMedida = computed(() => form.diseno_modelado === DISENO_A_MEDIDA)
+
+const laborCostH = computed(() => Number(store.appData.global_config.labor_cost_h || 0))
+const markupOptions = computed(() => Object.keys(MARKUP))
+const cantidadUds = computed(() => Math.max(1, Math.floor(Number(form.cantidad) || 1)))
+
+const disenoTarifa = computed(() => esDisenoAMedida.value
+    ? Math.max(0, Number(form.diseno_horas) || 0) * laborCostH.value
+    : (disenoOptions.value.find(o => o.value === form.diseno_modelado)?.eur || 0))
+// El post-procesado es trabajo pieza a pieza: escala con la cantidad.
+const postprocTarifaUd = computed(() => postprocOptions.value.find(o => o.value === form.postprocesado)?.eur || 0)
+const postprocTarifa = computed(() => postprocTarifaUd.value * cantidadUds.value)
+const manoObraTotal = computed(() => disenoTarifa.value + postprocTarifa.value)
+const llevaPintura = computed(() => form.postprocesado === 'Avanzado (+ pintura)')
+
 
 const detailedBreakdown = computed(() => {
     if (!result.value) return null
@@ -402,12 +392,11 @@ onMounted(() => {
         is_shared: !!cs.is_shared,
         shared_percent_3dcc: Number(cs.shared_percent_3dcc ?? 50),
         shared_percent_silab3d: Number(cs.shared_percent_silab3d ?? 50),
-        diseno_modelado: cs.diseno_modelado || OPTIONS.diseno[0],
-        busqueda_modelos: cs.busqueda_modelos || OPTIONS.busqueda[0],
-        eliminacion_soportes: cs.eliminacion_soportes || OPTIONS.soportes[0],
-        postprocesado: cs.postprocesado || OPTIONS.postproc[0],
+        diseno_modelado: cs.diseno_modelado || 'No necesario',
+        diseno_horas: Number(cs.diseno_horas) || 1,
+        postprocesado: cs.postprocesado || 'Limpio',
         probabilidad_error: cs.probabilidad_error || OPTIONS.probError[0].value,
-        markup: cs.markup || OPTIONS.markup[0],
+        markup: cs.markup || Object.keys(MARKUP)[0],
         urgencia_nivel: cs.urgencia_nivel || OPTIONS.urgencia[0],
         gasto_misc: Number(cs.gasto_misc || 0),
     })
@@ -426,6 +415,30 @@ onMounted(() => {
 watch(() => form.is_shared, (val) => {
     if (val && !store.partnerInventory) store.loadPartnerInventory()
 })
+
+/* ── Precarga desde la bandeja de presupuestos web (fase 2) ── */
+function applyWebQuotePrefill(pending) {
+    const p = pending?.prefill
+    if (!p) return
+    if (p.cliente) form.cliente = p.cliente
+    if (p.cliente_email) { form.cliente_email = p.cliente_email; lastAutofilledEmail = p.cliente_email }
+    if (p.descripcion) form.descripcion = p.descripcion
+    if (p.filamento_tipo && filamentOptions.value.includes(p.filamento_tipo)) form.filamento_tipo = p.filamento_tipo
+    if (p.filamento_color) form.filamento_color = p.filamento_color
+    if (Number(p.peso_g) > 0) form.peso_g = Number(p.peso_g)
+    if (Number(p.tiempo_h) > 0) form.tiempo_h = Number(p.tiempo_h)
+    form.cantidad = 1
+    form.fecha = new Date().toISOString().slice(0, 10)
+}
+
+onMounted(() => {
+    if (store.pendingWebQuote) applyWebQuotePrefill(store.pendingWebQuote)
+})
+watch(() => store.pendingWebQuote, (v) => {
+    if (v) applyWebQuotePrefill(v)
+})
+
+const descartarWebQuote = () => { store.pendingWebQuote = null }
 
 let _saveTimer = null
 watch(form, () => {
@@ -479,11 +492,16 @@ const calculate = async () => {
         const payload = structuredClone({
             ...form,
             material_breakdown,
+            partner_printers: partnerPrintersPayload(),
             deterioro_impresora: 'Autofinanciación'
         })
         const res = await store.calculate(payload)
         result.value = res
         updateCharts(res)
+        if (isHandheld.value) {
+            await nextTick()
+            resultsAnchor.value?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+        }
     } catch (e) {
         toast.add({ severity: 'error', summary: 'Error de cálculo', detail: e.message, life: 5000 })
     }
@@ -587,34 +605,6 @@ const barOpts = {
     }
 }
 
-const pendingCount = computed(() => {
-    if (!store.isLoaded) return 0
-    return store.appData.orders.filter(o => !o.archived && ['Aceptado', 'En producción', 'Post-procesado', 'Listo para entregar', 'Entregado'].includes(o.estado) &&
-        Number(o.importe_pagado || 0) < Number(o.precio_final || 0)).length
-})
-const pendingAmount = computed(() => {
-    if (!store.isLoaded) return 0
-    return store.appData.orders
-        .filter(o => !o.archived && ['Aceptado', 'En producción', 'Post-procesado', 'Listo para entregar', 'Entregado'].includes(o.estado))
-        .reduce((s, o) => {
-            const diff = Number(o.precio_final || 0) - Number(o.importe_pagado || 0)
-            return s + (diff > 0 ? diff : 0)
-        }, 0)
-})
-const thisMonthRevenue = computed(() => {
-    if (!store.isLoaded) return 0
-    const now = new Date()
-    return store.appData.orders
-        .filter(o => ['Aceptado', 'En producción', 'Post-procesado', 'Listo para entregar', 'Entregado'].includes(o.estado))
-        .filter(o => {
-            if (!o.fecha) return false
-            const [y, m] = o.fecha.split('-').map(Number)
-            return y === now.getFullYear() && m === now.getMonth() + 1
-        })
-        .reduce((s, o) => s + Number(o.precio_final || 0), 0)
-})
-const calcUnit = computed(() => store.appData?.global_config?.money_unit || '€')
-
 const _decideEmailForNew = async () => {
     const email = String(form.cliente_email || '').trim()
     const emailEnabled = !!store.appData.global_config?.email_enabled
@@ -664,7 +654,7 @@ const saveOrder = async () => {
             acceptProps: { severity: 'warn' },
             accept: async () => {
                 try {
-                    const payload = JSON.parse(JSON.stringify({ ...form, material_breakdown: calcMixBreakdown, deterioro_impresora: 'Autofinanciación' }))
+                    const payload = JSON.parse(JSON.stringify({ ...form, material_breakdown: calcMixBreakdown, partner_printers: partnerPrintersPayload(), deterioro_impresora: 'Autofinanciación' }))
                     const res = await store.recalculateOrder({ orderId: existing.id, payload })
                     toast.add({ severity: 'success', summary: 'Pedido actualizado', detail: `#${existing.id} — nuevo precio: ${res.newPrice?.toFixed(2)} ${result.value.info?.unit || '€'}`, life: 4000 })
                 } catch (e) {
@@ -767,45 +757,42 @@ const exportBothPdfs = async () => {
 </script>
 
 <template>
-    <div class="flex flex-col gap-4">
-        <!-- Context strip -->
-        <div v-if="store.isLoaded && (pendingCount > 0 || pendingAmount > 0)" class="flex flex-wrap gap-2 mb-1">
-            <div v-if="pendingCount > 0" class="flex items-center gap-1.5 px-3 py-1.5 rounded-full card text-xs font-medium text-amber-700 dark:text-amber-300">
-                <i class="pi pi-clock text-[10px]" />
-                <span>{{ pendingCount }} por cobrar</span>
-            </div>
-            <div v-if="pendingAmount > 0" class="flex items-center gap-1.5 px-3 py-1.5 rounded-full card text-xs font-medium text-red-700 dark:text-red-300">
-                <i class="pi pi-euro text-[10px]" />
-                <span>{{ pendingAmount.toFixed(2) }} {{ calcUnit }} pendiente</span>
-            </div>
-            <div class="flex items-center gap-1.5 px-3 py-1.5 rounded-full card text-xs font-medium text-emerald-700 dark:text-emerald-300">
-                <i class="pi pi-chart-line text-[10px]" />
-                <span>{{ thisMonthRevenue.toFixed(2) }} {{ calcUnit }} este mes</span>
-            </div>
+    <div class="flex flex-col gap-4" :class="isHandheld ? 'pb-24' : ''">
+        <!-- ═══ Aviso: presupuesto web pendiente de enlazar ═══ -->
+        <div v-if="store.pendingWebQuote" class="rounded-2xl border border-sky-300/60 dark:border-sky-700/50 bg-sky-50 dark:bg-sky-950/30 px-3 py-2 flex flex-wrap items-center gap-2">
+            <i class="pi pi-globe text-sky-600 dark:text-sky-300 text-sm" />
+            <span class="text-sm text-sky-700 dark:text-sky-300">
+                <strong class="font-mono">{{ store.pendingWebQuote.codigo }}</strong> precargado
+                <template v-if="store.pendingWebQuote.prefill?.precio_web != null">
+                    · precio estimado en la web: <strong>{{ formatMoney(store.pendingWebQuote.prefill.precio_web) }}</strong>
+                </template>
+            </span>
+            <span class="text-xs text-surface-400 dark:text-white/30">al guardar el pedido quedará enlazado y la web se actualizará sola</span>
+            <Button label="Descartar" icon="pi pi-times" size="small" text severity="secondary" class="ml-auto" @click="descartarWebQuote" />
         </div>
 
         <div class="flex flex-col 2xl:flex-row gap-6">
             <!-- LEFT: Form -->
             <div class="w-full 2xl:w-[420px] 2xl:shrink-0 flex flex-col gap-4 min-w-0">
-                <Panel header="Proyecto" toggleable :pt="{ root: { class: 'card rounded-2xl border-0 overflow-hidden' }, header: { class: '!bg-transparent border-b border-black/[0.05] dark:border-white/[0.06] px-4 py-3' }, content: { class: '!bg-transparent p-4' } }">
+                <Panel header="Información del proyecto" toggleable :pt="{ root: { class: 'card rounded-2xl border-0 overflow-hidden' }, header: { class: '!bg-transparent border-b border-black/[0.05] dark:border-white/[0.06] px-4 py-3' }, content: { class: '!bg-transparent p-4' } }">
                     <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                        <div class="flex flex-col gap-1">
+                        <div class="flex flex-col gap-1 min-w-0">
                             <label class="text-sm text-surface-400">Empresa</label>
                             <InputText :modelValue="store.empresa" class="w-full" disabled />
                         </div>
-                        <div class="flex flex-col gap-1">
+                        <div class="flex flex-col gap-1 min-w-0">
                             <label class="text-sm text-surface-400">Cliente</label>
-                            <AutoComplete v-model="form.cliente" :suggestions="clientSuggestions" @complete="filterClients" @select="onClientSelect" dropdownMode="blank" dropdown class="w-full" :invalid="!!errors.cliente" />
+                            <InputText v-model="form.cliente" class="w-full" placeholder="Nombre del cliente" autocomplete="off" :invalid="!!errors.cliente" />
                         </div>
-                        <div class="flex flex-col gap-1">
+                        <div class="flex flex-col gap-1 min-w-0">
                             <label class="text-sm text-surface-400">Fecha</label>
                             <DatePicker v-model="formFechaDate" dateFormat="dd/mm/yy" showIcon iconDisplay="input" class="w-full" :invalid="!!errors.fecha" />
                         </div>
-                        <div class="flex flex-col gap-1">
+                        <div class="flex flex-col gap-1 min-w-0">
                             <label class="text-sm text-surface-400">Descripción</label>
                             <InputText v-model="form.descripcion" class="w-full" :invalid="!!errors.descripcion" />
                         </div>
-                        <div class="flex flex-col gap-1 sm:col-span-2">
+                        <div class="flex flex-col gap-1 sm:col-span-2 min-w-0">
                             <label class="text-sm text-surface-400 flex items-center gap-1.5">
                                 <i class="pi pi-envelope text-xs" />
                                 Email del cliente
@@ -839,11 +826,11 @@ const exportBothPdfs = async () => {
                     </div>
                 </Panel>
 
-                <Panel header="Impresión" toggleable :pt="{ root: { class: 'card rounded-2xl border-0 overflow-hidden' }, header: { class: '!bg-transparent border-b border-black/[0.05] dark:border-white/[0.06] px-4 py-3' }, content: { class: '!bg-transparent p-4' } }">
+                <Panel header="Parámetros básicos" toggleable :pt="{ root: { class: 'card rounded-2xl border-0 overflow-hidden' }, header: { class: '!bg-transparent border-b border-black/[0.05] dark:border-white/[0.06] px-4 py-3' }, content: { class: '!bg-transparent p-4' } }">
                     <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 overflow-hidden">
                         <div class="flex flex-col gap-1 min-w-0">
                             <label class="text-sm text-surface-400">Impresora</label>
-                            <Select v-model="form.impresora" :options="printerOptions" class="w-full" :invalid="!!errors.impresora" />
+                            <Select v-model="form.impresora" :options="printerOptions" optionLabel="label" optionValue="value" class="w-full" :invalid="!!errors.impresora" />
                         </div>
                         <div class="flex flex-col gap-1 min-w-0">
                             <label class="text-sm text-surface-400">Material</label>
@@ -873,6 +860,9 @@ const exportBothPdfs = async () => {
                             <InputNumber v-model="form.cantidad" :min="1" :step="1" class="w-full" :pt="{ root: { class: 'w-full' }, input: { style: 'width:100%;min-width:0' } }" />
                         </div>
                     </div>
+                    <small class="text-surface-400 mt-2 block">
+                        <i class="pi pi-info-circle mr-1" />Peso y tiempo son <strong>totales del pedido</strong>, de todas las piezas juntas. La cantidad reparte el precio por unidad y multiplica el post-procesado.
+                    </small>
                     <div class="flex items-center gap-3 mt-3 p-2 bg-surface-100 dark:bg-surface-800 rounded-lg">
                         <Checkbox v-model="form.is_multimaterial" binary inputId="multi" />
                         <label for="multi" class="text-sm cursor-pointer">Multicolor / Multimaterial</label>
@@ -883,13 +873,16 @@ const exportBothPdfs = async () => {
                             <span class="text-xs font-semibold text-amber-600 dark:text-amber-400 uppercase tracking-wide">Mezcla de colores</span>
                             <Button icon="pi pi-plus" size="small" text severity="success" @click="addMixLine" v-tooltip.top="'Añadir color'" />
                         </div>
-                        <div v-for="(line, idx) in mixLines" :key="idx" class="grid gap-1 items-end overflow-hidden" :style="{ gridTemplateColumns: mixLines.length > 2 ? '6rem 1fr 4.5rem 3.5rem 2rem' : '6rem 1fr 4.5rem 3.5rem' }">
+                        <div v-for="(line, idx) in mixLines" :key="idx"
+                            class="grid gap-2 items-end overflow-hidden"
+                            :class="isHandheld ? 'grid-cols-2 p-2.5 rounded-xl bg-white/60 dark:bg-white/[0.04]' : ''"
+                            :style="isHandheld ? null : { gridTemplateColumns: mixLines.length > 2 ? '6rem 1fr 4.5rem 3.5rem 2rem' : '6rem 1fr 4.5rem 3.5rem' }">
                             <div class="flex flex-col gap-1 overflow-hidden">
-                                <label v-if="idx === 0" class="text-[11px] text-surface-400">Material</label>
+                                <label v-if="idx === 0 || isHandheld" class="text-[11px] text-surface-400">Material</label>
                                 <Select v-model="line.material" :options="filamentOptions" placeholder="Material" class="w-full" @update:modelValue="onMixMaterialChange(idx)" />
                             </div>
                             <div class="flex flex-col gap-1 overflow-hidden">
-                                <label v-if="idx === 0" class="text-[11px] text-surface-400">Color</label>
+                                <label v-if="idx === 0 || isHandheld" class="text-[11px] text-surface-400">Color</label>
                                 <Select v-model="line.color" :options="getColorOptionsByMaterial(line.material)" optionLabel="label" optionValue="value" placeholder="Color" class="w-full">
                                     <template #option="slotProps">
                                         <div class="flex items-center gap-2">
@@ -900,14 +893,17 @@ const exportBothPdfs = async () => {
                                 </Select>
                             </div>
                             <div class="flex flex-col gap-1 overflow-hidden">
-                                <label v-if="idx === 0" class="text-[11px] text-surface-400">Peso (g)</label>
+                                <label v-if="idx === 0 || isHandheld" class="text-[11px] text-surface-400">Peso (g)</label>
                                 <InputNumber v-model="line.grams" placeholder="g" suffix=" g" :inputStyle="{ width: '100%', minWidth: '0' }" class="w-full [&_input]:!w-full [&_input]:!min-w-0" />
                             </div>
-                            <div class="flex flex-col gap-1">
-                                <label v-if="idx === 0" class="text-[11px] text-surface-400">Gasto</label>
+                            <div class="flex flex-col gap-1 min-w-0">
+                                <label v-if="idx === 0 || isHandheld" class="text-[11px] text-surface-400">Gasto</label>
                                 <span class="text-xs font-mono font-semibold text-amber-600 dark:text-amber-400 py-2 text-right whitespace-nowrap">{{ mixLineCost(line).toFixed(2) }}{{ unit }}</span>
                             </div>
-                            <Button v-if="mixLines.length > 2" icon="pi pi-times" size="small" text severity="danger" class="mb-0.5 self-end" @click="removeMixLine(idx)" v-tooltip.top="'Quitar'" />
+                            <Button v-if="mixLines.length > 2" icon="pi pi-times" text severity="danger"
+                                :class="isHandheld ? 'col-span-2 !h-11' : 'mb-0.5 self-end'"
+                                :label="isHandheld ? 'Quitar color' : null"
+                                aria-label="Quitar color" @click="removeMixLine(idx)" v-tooltip.top="'Quitar'" />
                         </div>
                         <div class="flex items-center justify-between mt-2 pt-2 border-t border-amber-200 dark:border-amber-700">
                             <span class="text-xs text-surface-500">Total: <strong>{{ mixTotalGrams.toFixed(0) }} g</strong></span>
@@ -919,40 +915,88 @@ const exportBothPdfs = async () => {
                     </small>
                 </Panel>
 
-                <Panel header="Factores de Coste" toggleable :pt="{ root: { class: 'card rounded-2xl border-0 overflow-hidden' }, header: { class: '!bg-transparent border-b border-black/[0.05] dark:border-white/[0.06] px-4 py-3' }, content: { class: '!bg-transparent p-4' } }">
+                <Panel header="Parámetros complementarios" toggleable :pt="{ root: { class: 'card rounded-2xl border-0 overflow-hidden' }, header: { class: '!bg-transparent border-b border-black/[0.05] dark:border-white/[0.06] px-4 py-3' }, content: { class: '!bg-transparent p-4' } }">
                     <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                        <div class="flex flex-col gap-1">
-                            <label class="text-sm text-surface-400">Diseño</label>
-                            <Select v-model="form.diseno_modelado" :options="OPTIONS.diseno" class="w-full" />
+                        <div class="flex flex-col gap-1 col-span-full min-w-0">
+                            <label class="text-sm text-surface-400 flex items-center justify-between gap-2">
+                                <span>Diseño</span>
+                                <span class="font-mono text-xs" :class="disenoTarifa > 0 ? 'text-amber-600 dark:text-amber-400' : 'text-surface-400'">{{ formatMoney(disenoTarifa) }}</span>
+                            </label>
+                            <Select v-model="form.diseno_modelado" :options="disenoOptions" optionLabel="label" optionValue="value" class="w-full">
+                                <template #option="{ option }">
+                                    <div class="flex items-baseline justify-between gap-3 w-full min-w-0">
+                                        <div class="min-w-0">
+                                            <div class="font-medium">{{ option.label }}</div>
+                                            <div class="text-xs text-surface-400 leading-snug whitespace-normal">{{ option.desc }}</div>
+                                        </div>
+                                        <span class="font-mono text-xs shrink-0" :class="option.eur > 0 || option.custom ? 'text-amber-600 dark:text-amber-400' : 'text-surface-400'">
+                                            {{ option.custom ? formatMoney(laborCostH) + '/h' : formatMoney(option.eur) }}
+                                        </span>
+                                    </div>
+                                </template>
+                            </Select>
+                            <div v-if="esDisenoAMedida" class="flex items-center gap-2 mt-1">
+                                <InputNumber v-model="form.diseno_horas" :min="0" :step="0.25" :minFractionDigits="0" :maxFractionDigits="2"
+                                    suffix=" h" showButtons buttonLayout="horizontal" class="w-40"
+                                    incrementButtonIcon="pi pi-plus" decrementButtonIcon="pi pi-minus" />
+                                <span class="text-xs text-surface-400">× {{ formatMoney(laborCostH) }}/h = <strong class="text-amber-600 dark:text-amber-400">{{ formatMoney(disenoTarifa) }}</strong></span>
+                            </div>
+                            <small class="text-surface-400">Se cobra una sola vez por pedido, sean 1 o 50 piezas.</small>
                         </div>
-                        <div class="flex flex-col gap-1">
-                            <label class="text-sm text-surface-400">Búsqueda Modelos</label>
-                            <Select v-model="form.busqueda_modelos" :options="OPTIONS.busqueda" class="w-full" />
+
+                        <div class="flex flex-col gap-1 col-span-full min-w-0">
+                            <label class="text-sm text-surface-400 flex items-center justify-between gap-2">
+                                <span>Post-procesado <span class="text-xs">(incluye soportes)</span></span>
+                                <span class="font-mono text-xs" :class="postprocTarifa > 0 ? 'text-amber-600 dark:text-amber-400' : 'text-surface-400'">{{ formatMoney(postprocTarifa) }}</span>
+                            </label>
+                            <Select v-model="form.postprocesado" :options="postprocOptions" optionLabel="label" optionValue="value" class="w-full">
+                                <template #option="{ option }">
+                                    <div class="flex items-baseline justify-between gap-3 w-full min-w-0">
+                                        <div class="min-w-0">
+                                            <div class="font-medium">{{ option.label }}</div>
+                                            <div class="text-xs text-surface-400 leading-snug whitespace-normal">{{ option.desc }}</div>
+                                        </div>
+                                        <span class="font-mono text-xs shrink-0" :class="option.eur > 0 ? 'text-amber-600 dark:text-amber-400' : 'text-surface-400'">
+                                            {{ formatMoney(option.eur) }}<span v-if="cantidadUds > 1" class="text-surface-400">/ud.</span>
+                                        </span>
+                                    </div>
+                                </template>
+                            </Select>
+                            <small v-if="cantidadUds > 1 && postprocTarifaUd > 0" class="text-surface-400">
+                                {{ formatMoney(postprocTarifaUd) }}/ud. × {{ cantidadUds }} uds. = <strong class="text-amber-600 dark:text-amber-400">{{ formatMoney(postprocTarifa) }}</strong> — el acabado es manual y se repite en cada pieza.
+                            </small>
+                            <small v-else class="text-surface-400">Los soportes ya van dentro del tramo; se multiplica por cada pieza.</small>
+                            <div v-if="llevaPintura" class="flex items-start gap-2 mt-1 p-2 rounded-lg bg-amber-50 dark:bg-amber-950/20 border border-amber-200 dark:border-amber-800">
+                                <i class="pi pi-info-circle text-amber-500 text-xs mt-0.5" />
+                                <span class="text-xs text-amber-700 dark:text-amber-300">La tarifa cubre la mano de obra. Añade imprimación, pinturas y barniz en <strong>Extras / Misceláneos</strong>.</span>
+                            </div>
                         </div>
-                        <div class="flex flex-col gap-1">
-                            <label class="text-sm text-surface-400">Soportes</label>
-                            <Select v-model="form.eliminacion_soportes" :options="OPTIONS.soportes" class="w-full" />
+
+                        <div v-if="manoObraTotal > 0" class="col-span-full flex items-center justify-between px-3 py-2 rounded-lg card-inset">
+                            <span class="text-xs font-semibold uppercase tracking-wide text-surface-500">Mano de obra</span>
+                            <span class="font-mono font-bold text-amber-600 dark:text-amber-400">{{ formatMoney(manoObraTotal) }}</span>
                         </div>
-                        <div class="flex flex-col gap-1">
-                            <label class="text-sm text-surface-400">Postprocesado</label>
-                            <Select v-model="form.postprocesado" :options="OPTIONS.postproc" class="w-full" />
-                        </div>
-                        <div class="flex flex-col gap-1">
+                        <div class="flex flex-col gap-1 min-w-0">
                             <label class="text-sm text-surface-400">Prob. Error</label>
                             <div class="flex gap-1">
-                                <InputText :modelValue="form.probabilidad_error" readonly class="flex-1" @click="openRiskDialog" />
+                                <InputText :modelValue="form.probabilidad_error" readonly class="flex-1 min-w-0 !cursor-pointer"
+                                    @click="openRiskDialog" v-tooltip.top="'Pulsa para calcular el riesgo con el cuestionario'" />
                                 <Button icon="pi pi-question-circle" @click="openRiskDialog" severity="secondary" v-tooltip.top="'Calcular riesgo mediante cuestionario'" />
                             </div>
                         </div>
-                        <div class="flex flex-col gap-1">
+                        <div class="flex flex-col gap-1 min-w-0">
                             <label class="text-sm text-surface-400">Markup</label>
-                            <Select v-model="form.markup" :options="OPTIONS.markup" class="w-full" />
+                            <Select v-if="markupOptions.length > 1" v-model="form.markup" :options="markupOptions" class="w-full" />
+                            <div v-else class="flex items-center gap-2 px-3 py-2.5 rounded-lg card-inset text-sm text-surface-500">
+                                <span>{{ form.markup }}</span>
+                                <i class="pi pi-lock text-[10px] ml-auto" v-tooltip.top="'Margen fijo de la casa: se aplica sobre filamento, luz y desgaste.'" />
+                            </div>
                         </div>
-                        <div class="flex flex-col gap-1 col-span-2">
+                        <div class="flex flex-col gap-1 col-span-full min-w-0">
                             <label class="text-sm text-surface-400">Urgencia</label>
                             <Select v-model="form.urgencia_nivel" :options="OPTIONS.urgencia" class="w-full" />
                         </div>
-                        <div class="flex flex-col gap-1 col-span-2">
+                        <div class="flex flex-col gap-1 col-span-full min-w-0">
                             <label class="text-sm text-surface-400 flex items-center gap-1">
                                 <i class="pi pi-tag text-xs" /> Extras / Misceláneos
                             </label>
@@ -963,34 +1007,29 @@ const exportBothPdfs = async () => {
                     </div>
                 </Panel>
 
-                <Button label="Calcular Presupuesto" icon="pi pi-bolt" @click="calculate" class="w-full" severity="info" size="large" />
+                <Button v-if="!isHandheld" label="Calcular Presupuesto" icon="pi pi-bolt" @click="calculate" class="w-full" severity="info" size="large" />
             </div>
 
             <!-- RIGHT: Results -->
-            <div class="flex-1 min-w-0">
+            <div ref="resultsAnchor" class="flex-1 min-w-0 scroll-mt-4">
                 <div v-if="result" class="flex flex-col gap-4">
-                    <!-- Summary Cards -->
-                    <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
-                        <div class="flex flex-col gap-2">
-                            <div class="bg-primary-50 dark:bg-primary-950/30 border border-primary-200 dark:border-primary-800 rounded-xl p-4 text-center flex-1 flex flex-col justify-center">
+                    <!-- Precios del proyecto -->
+                    <div class="flex flex-col gap-2">
+                        <div class="text-xs font-semibold uppercase tracking-wider text-surface-500 px-1">Precios del proyecto</div>
+                        <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+                            <div class="bg-primary-50 dark:bg-primary-950/30 border border-primary-200 dark:border-primary-800 rounded-xl p-4 text-center">
                                 <div class="text-xs text-primary-600 dark:text-primary-400 font-semibold uppercase tracking-wide">Precio Total</div>
                                 <div class="text-2xl font-bold text-primary-700 dark:text-primary-300 mt-1">{{ summaryMetrics.precioFinal.toFixed(2) }} {{ unit }}</div>
                                 <div v-if="summaryMetrics.cantidad > 1" class="text-xs text-primary-500 mt-1">{{ summaryMetrics.cantidad }} ud. × {{ summaryMetrics.precioUnitario.toFixed(2) }} {{ unit }}/ud.</div>
                             </div>
-                            
-                            <div class="bg-orange-50 dark:bg-orange-900/20 border border-orange-200 dark:border-orange-800 rounded-xl p-3 text-center">
-                                <div class="text-[10px] text-orange-600 dark:text-orange-400 font-semibold uppercase tracking-wide">Coste por Error</div>
-                                <div class="text-lg font-bold text-orange-700 dark:text-orange-300">{{ formatMoney(summaryMetrics.costeBruto / Math.max(1, summaryMetrics.cantidad)) }}</div>
-                                <div class="text-[10px] text-orange-500 mt-1 leading-tight">Coste bruto por pieza. Cada reimpresión fallida resta este importe del beneficio neto.</div>
+                            <div class="bg-green-50 dark:bg-green-950/30 border border-green-200 dark:border-green-800 rounded-xl p-4 text-center">
+                                <div class="text-xs text-green-600 dark:text-green-400 font-semibold uppercase tracking-wide">Beneficio</div>
+                                <div class="text-2xl font-bold text-green-700 dark:text-green-300 mt-1">{{ summaryMetrics.beneficioNeto.toFixed(2) }} {{ unit }}</div>
                             </div>
-                        </div>
-                        <div class="bg-green-50 dark:bg-green-950/30 border border-green-200 dark:border-green-800 rounded-xl p-4 text-center">
-                            <div class="text-xs text-green-600 dark:text-green-400 font-semibold uppercase tracking-wide">Beneficio</div>
-                            <div class="text-2xl font-bold text-green-700 dark:text-green-300 mt-1">{{ summaryMetrics.beneficioNeto.toFixed(2) }} {{ unit }}</div>
-                        </div>
-                        <div class="card-inset rounded-xl p-4 text-center">
-                            <div class="text-xs text-surface-500 font-semibold uppercase tracking-wide">Coste Bruto</div>
-                            <div class="text-2xl font-bold mt-1">{{ summaryMetrics.costeBruto.toFixed(2) }} {{ unit }}</div>
+                            <div class="card-inset rounded-xl p-4 text-center">
+                                <div class="text-xs text-surface-500 font-semibold uppercase tracking-wide">Coste Bruto</div>
+                                <div class="text-2xl font-bold mt-1">{{ summaryMetrics.costeBruto.toFixed(2) }} {{ unit }}</div>
+                            </div>
                         </div>
                     </div>
 
@@ -1018,7 +1057,7 @@ const exportBothPdfs = async () => {
                             <!-- Sección 1: Bruto -->
                             <div class="rounded-xl card-inset">
                                 <div class="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-surface-500 border-b border-black/[0.04] dark:border-white/[0.06]">
-                                    Bruto <span class="font-normal normal-case">(filamento + electricidad)</span>
+                                    Parámetros básicos <span class="font-normal normal-case">(filamento + electricidad + maquinaria)</span>
                                 </div>
                                 <div class="px-3 py-1">
                                     <div v-for="row in detailedBreakdown?.brutoRows || []" :key="`bruto-${row.label}`"
@@ -1036,7 +1075,7 @@ const exportBothPdfs = async () => {
                             <!-- Sección 2: Complementos -->
                             <div class="rounded-xl card-inset">
                                 <div class="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-surface-500 border-b border-black/[0.04] dark:border-white/[0.06]">
-                                    Complementos <span class="font-normal normal-case">(mano de obra + extras)</span>
+                                    Parámetros complementarios <span class="font-normal normal-case">(mano de obra + extras)</span>
                                 </div>
                                 <div class="px-3 py-1">
                                     <div v-for="row in detailedBreakdown?.complementosRows || []" :key="`comp-${row.label}`"
@@ -1107,26 +1146,26 @@ const exportBothPdfs = async () => {
         <!-- Risk Assessment Dialog -->
         <Dialog v-model:visible="riskDialog" modal header="Cuestionario de Riesgo" :style="{ width: '32rem' }">
             <div class="flex flex-col gap-4 py-2">
-                <p class="text-sm text-surface-500 mb-2">Responde estas 4 preguntas para que el sistema calcule la probabilidad de fallo recomendada.</p>
-                
-                <div class="flex flex-col gap-1">
-                    <label class="text-sm font-semibold">1. Geometría y Estabilidad</label>
-                    <Select v-model="indiceError.estabilidad" :options="OPTIONS.estabilidad" optionLabel="label" optionValue="value" class="w-full" />
-                </div>
-                
-                <div class="flex flex-col gap-1">
-                    <label class="text-sm font-semibold">2. Dificultad Técnica del Material</label>
-                    <Select v-model="indiceError.material" :options="OPTIONS.materialDificultad" optionLabel="label" optionValue="value" class="w-full" />
+                <p class="text-sm text-surface-500 mb-2">Responde estas 4 preguntas para calcular la probabilidad de error (25% – 200%). Cada factor adverso sube un nivel.</p>
+
+                <div class="flex flex-col gap-1 min-w-0">
+                    <label class="text-sm font-semibold">1. Geometría y estabilidad</label>
+                    <Select v-model="indiceError.geometria" :options="OPTIONS.geometria" optionLabel="label" optionValue="value" class="w-full" />
                 </div>
 
-                <div class="flex flex-col gap-1">
-                    <label class="text-sm font-semibold">3. Multicolor o Monocolor</label>
-                    <Select v-model="indiceError.multicolor" :options="OPTIONS.esMulticolor" optionLabel="label" optionValue="value" class="w-full" />
+                <div class="flex flex-col gap-1 min-w-0">
+                    <label class="text-sm font-semibold">2. Dificultad técnica</label>
+                    <Select v-model="indiceError.dificultad" :options="OPTIONS.dificultadTecnica" optionLabel="label" optionValue="value" class="w-full" />
                 </div>
-                
-                <div class="flex flex-col gap-1">
-                    <label class="text-sm font-semibold">4. Estado del Modelo / I+D</label>
-                    <Select v-model="indiceError.puesta" :options="OPTIONS.puestaAPunto" optionLabel="label" optionValue="value" class="w-full" />
+
+                <div class="flex flex-col gap-1 min-w-0">
+                    <label class="text-sm font-semibold">3. Duración individual</label>
+                    <Select v-model="indiceError.duracion" :options="OPTIONS.duracionIndividual" optionLabel="label" optionValue="value" class="w-full" />
+                </div>
+
+                <div class="flex flex-col gap-1 min-w-0">
+                    <label class="text-sm font-semibold">4. I+D</label>
+                    <Select v-model="indiceError.id" :options="OPTIONS.idOptimizacion" optionLabel="label" optionValue="value" class="w-full" />
                 </div>
 
                 <div class="flex items-center justify-between p-4 rounded-2xl mt-2 bg-surface-100 dark:bg-surface-800/50 border border-black/[0.05] dark:border-white/[0.05]">
@@ -1164,5 +1203,20 @@ const exportBothPdfs = async () => {
             @skip="onEmailDialogSkip"
             @cancel="onEmailDialogCancel"
         />
+
+        <!-- ═══ Barra de acción móvil ═══
+             Anclada abajo (zona del pulgar) y con el precio ya visible, para
+             no tener que buscar el resultado a ciegas después de calcular. -->
+        <div v-if="isHandheld"
+            class="fixed inset-x-0 bottom-0 z-40 flex items-center gap-3 px-4 pt-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] border-t border-black/[0.06] dark:border-white/[0.08] backdrop-blur-xl bg-white/85 dark:bg-[#141414]/90">
+            <div v-if="result" class="min-w-0 flex-1">
+                <div class="text-[10px] uppercase tracking-widest text-surface-400 leading-none">Precio total</div>
+                <div class="text-xl font-semibold tracking-tight truncate">{{ formatMoney(summaryMetrics.precioFinal) }}</div>
+            </div>
+            <div v-else class="min-w-0 flex-1">
+                <div class="text-[11px] text-surface-400 leading-snug">Mano de obra {{ formatMoney(manoObraTotal) }}</div>
+            </div>
+            <Button label="Calcular" icon="pi pi-bolt" severity="info" class="!h-12 shrink-0 px-5" @click="calculate" />
+        </div>
     </div>
 </template>
