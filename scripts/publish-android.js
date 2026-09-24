@@ -43,7 +43,10 @@ console.log(`\n=== Building signed Android APK for ${tag} ===\n`)
 
 run('npx vite build')
 run('npx cap sync android')
-run('gradlew.bat assembleRelease', { cwd: 'android' })
+// El `.\` no es decorativo: execSync lanza `cmd.exe /d /s /c`, que no busca
+// ejecutables en el directorio actual, así que `gradlew.bat` a secas falla con
+// "no se reconoce como un comando interno o externo".
+run('.\\gradlew.bat assembleRelease', { cwd: 'android' })
 
 const apkSrc = path.join('android', 'app', 'build', 'outputs', 'apk', 'release', 'app-release.apk')
 if (!fs.existsSync(apkSrc)) {

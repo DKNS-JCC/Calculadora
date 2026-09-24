@@ -7,7 +7,6 @@ import { useToast } from 'primevue/usetoast'
 import { useConfirm } from 'primevue/useconfirm'
 import Select from 'primevue/select'
 import InputText from 'primevue/inputtext'
-import InputNumber from 'primevue/inputnumber'
 import Checkbox from 'primevue/checkbox'
 import Button from 'primevue/button'
 import Dialog from 'primevue/dialog'
@@ -18,8 +17,11 @@ import Slider from 'primevue/slider'
 import DatePicker from 'primevue/datepicker'
 import ChartCard from './ChartCard.vue'
 import EmailNotifyDialog from './EmailNotifyDialog.vue'
+import CampoNumero from './CampoNumero.vue'
+import CampoTiempo from './CampoTiempo.vue'
 import { useEmailConfirm } from '../composables/useEmailConfirm'
-import { laborOptions, DISENO_A_MEDIDA, MARKUP } from '../shared/backend.mjs'
+import { laborOptions, disenoCostH, DISENO_A_MEDIDA, MARKUP } from '../shared/backend.mjs'
+import { formatNumero } from '../shared/formatos.mjs'
 import { useIsHandheld } from '../composables/useMediaQuery'
 
 const { state: emailConfirmState, ask: askEmailConfirm, answer: answerEmailConfirm } = useEmailConfirm()
@@ -73,8 +75,8 @@ const calcSchema = z.object({
     descripcion: z.string().min(1, 'Requerido'),
     impresora: z.string().min(1, 'Selecciona impresora'),
     filamento_tipo: z.string().min(1, 'Selecciona material'),
-    peso_g: z.number({ invalid_type_error: 'Número requerido' }).positive('Debe ser > 0'),
-    tiempo_h: z.number({ invalid_type_error: 'Número requerido' }).positive('Debe ser > 0'),
+    peso_g: z.number({ error: 'Indica el peso' }).positive('Debe ser mayor que 0'),
+    tiempo_h: z.number({ error: 'Indica el tiempo' }).positive('Debe ser mayor que 0'),
 })
 
 const toast = useToast()
@@ -84,6 +86,10 @@ const resultsAnchor = ref(null)
 const errors = ref({})
 
 /* ── Date picker helper ── */
+// Fecha local: toISOString() da la de UTC y de 00:00 a 02:00 marcaba el día anterior
+const fechaISO = (val) => `${val.getFullYear()}-${String(val.getMonth() + 1).padStart(2, '0')}-${String(val.getDate()).padStart(2, '0')}`
+const hoyISO = () => fechaISO(new Date())
+
 const formFechaDate = computed({
     get: () => {
         if (!form.fecha) return null
@@ -91,8 +97,7 @@ const formFechaDate = computed({
         return new Date(y, m - 1, d)
     },
     set: (val) => {
-        if (!val) { form.fecha = ''; return }
-        form.fecha = `${val.getFullYear()}-${String(val.getMonth() + 1).padStart(2, '0')}-${String(val.getDate()).padStart(2, '0')}`
+        form.fecha = val ? fechaISO(val) : ''
     }
 })
 
@@ -126,7 +131,7 @@ const form = reactive({
     empresa: store.empresa,
     cliente: '',
     cliente_email: '',
-    fecha: new Date().toISOString().slice(0, 10),
+    fecha: hoyISO(),
     descripcion: '',
     impresora: '',
     filamento_tipo: '',
@@ -147,6 +152,14 @@ const form = reactive({
     gasto_misc: 0,
 })
 watch(() => form.cliente, onClientSelected)
+
+// El error de un campo desaparece en cuanto se corrige, sin esperar a recalcular.
+// Síncrono: si no, un cambio hecho justo antes de validar (Enter) borraría el error recién puesto.
+watch(() => ({ ...form }), (nuevo, viejo) => {
+    for (const campo of Object.keys(errors.value)) {
+        if (nuevo[campo] !== viejo[campo]) delete errors.value[campo]
+    }
+}, { flush: 'sync' })
 
 const HEX_COLOR_MAP = {
     Negro: '#111827',
@@ -258,6 +271,9 @@ const mixLineCost = (line) => {
 }
 const mixTotalGrams = computed(() => mixLines.reduce((acc, l) => acc + Number(l.grams || 0), 0))
 const mixTotalCost = computed(() => mixLines.reduce((acc, l) => acc + mixLineCost(l), 0))
+const materialBreakdown = () => form.is_multimaterial
+    ? mixLines.filter(l => l.material && l.color && l.grams > 0).map(l => ({ ...l }))
+    : []
 
 const result = ref(null)
 const chartDataDonut = ref(null)
@@ -297,7 +313,7 @@ const disenoOptions = computed(() => tarifas.value.diseno)
 const postprocOptions = computed(() => tarifas.value.postproc)
 const esDisenoAMedida = computed(() => form.diseno_modelado === DISENO_A_MEDIDA)
 
-const laborCostH = computed(() => Number(store.appData.global_config.labor_cost_h || 0))
+const laborCostH = computed(() => disenoCostH(store.appData.global_config))
 const markupOptions = computed(() => Object.keys(MARKUP))
 const cantidadUds = computed(() => Math.max(1, Math.floor(Number(form.cantidad) || 1)))
 
@@ -380,7 +396,7 @@ onMounted(() => {
         empresa: store.empresa,
         cliente: cs.cliente || '',
         cliente_email: cs.cliente_email || '',
-        fecha: cs.fecha || new Date().toISOString().slice(0, 10),
+        fecha: cs.fecha || hoyISO(),
         descripcion: cs.descripcion || '',
         impresora: cs.impresora || (store.appData.printers[0]?.name || ''),
         filamento_tipo: cs.filamento_tipo || (store.appData.filament_types[0]?.name || ''),
@@ -428,7 +444,7 @@ function applyWebQuotePrefill(pending) {
     if (Number(p.peso_g) > 0) form.peso_g = Number(p.peso_g)
     if (Number(p.tiempo_h) > 0) form.tiempo_h = Number(p.tiempo_h)
     form.cantidad = 1
-    form.fecha = new Date().toISOString().slice(0, 10)
+    form.fecha = hoyISO()
 }
 
 onMounted(() => {
@@ -444,13 +460,9 @@ let _saveTimer = null
 watch(form, () => {
     clearTimeout(_saveTimer)
     _saveTimer = setTimeout(() => {
-        const material_breakdown = form.is_multimaterial 
-            ? mixLines.filter(l => l.material && l.color && l.grams > 0).map(l => ({ ...l }))
-            : []
-
         store.saveCalcState(structuredClone({
             ...form,
-            material_breakdown,
+            material_breakdown: materialBreakdown(),
             deterioro_impresora: 'Autofinanciación'
         }))
     }, 600)
@@ -485,13 +497,9 @@ const calculate = async () => {
         return
     }
     try {
-        const material_breakdown = form.is_multimaterial 
-            ? mixLines.filter(l => l.material && l.color && l.grams > 0).map(l => ({ ...l }))
-            : []
-            
         const payload = structuredClone({
             ...form,
-            material_breakdown,
+            material_breakdown: materialBreakdown(),
             partner_printers: partnerPrintersPayload(),
             deterioro_impresora: 'Autofinanciación'
         })
@@ -505,6 +513,13 @@ const calculate = async () => {
     } catch (e) {
         toast.add({ severity: 'error', summary: 'Error de cálculo', detail: e.message, life: 5000 })
     }
+}
+
+// Enter en cualquier campo de texto del formulario lanza el cálculo
+const onEnterCalcular = (e) => {
+    const el = e.target
+    if (e.isComposing || el.tagName !== 'INPUT' || el.readOnly || el.type === 'checkbox') return
+    calculate()
 }
 
 const COLORS = ['#60A5FA', '#34D399', '#A78BFA', '#FBBF24', '#F472B6', '#22D3EE', '#FB923C', '#9CA3AF']
@@ -565,7 +580,7 @@ const pieOpts = {
                     const dataset = context.dataset?.data || []
                     const total = dataset.reduce((acc, value) => acc + Number(value || 0), 0)
                     const current = Number(context.raw || 0)
-                    const percent = total > 0 ? ((current / total) * 100).toFixed(1) : '0.0'
+                    const percent = formatNumero(total > 0 ? (current / total) * 100 : 0, { minDecimales: 1, maxDecimales: 1 })
                     return `${context.label}: ${formatMoney(current)} (${percent}%)`
                 }
             }
@@ -586,7 +601,7 @@ const barOpts = {
                     const dataset = context.dataset?.data || []
                     const total = dataset.reduce((acc, value) => acc + Number(value || 0), 0)
                     const current = Number(context.raw || 0)
-                    const percent = total > 0 ? ((current / total) * 100).toFixed(1) : '0.0'
+                    const percent = formatNumero(total > 0 ? (current / total) * 100 : 0, { minDecimales: 1, maxDecimales: 1 })
                     return `${formatMoney(current)} (${percent}%)`
                 }
             }
@@ -607,7 +622,7 @@ const barOpts = {
 
 const _decideEmailForNew = async () => {
     const email = String(form.cliente_email || '').trim()
-    const emailEnabled = !!store.appData.global_config?.email_enabled
+    const emailEnabled = store.puedeAvisar()
     if (!email || !emailEnabled) return { proceed: true, options: {} }
     const fakeOrder = {
         id: '——',
@@ -633,8 +648,43 @@ const _decideEmailForNew = async () => {
     return { proceed: true, options: {} }
 }
 
+const _payloadActual = () => JSON.parse(JSON.stringify({
+    ...form,
+    material_breakdown: materialBreakdown(),
+    partner_printers: partnerPrintersPayload(),
+    deterioro_impresora: 'Autofinanciación',
+}))
+
+/* Solicitud web precargada: su pedido ya existe (lo creó Supabase al llegar),
+ * así que se recalcula ese mismo y pasa a 'Presupuesto enviado'. */
+const presupuestarSolicitud = async () => {
+    const pending = store.pendingWebQuote
+    const decision = await _decideEmailForNew()
+    if (!decision.proceed) {
+        toast.add({ severity: 'secondary', summary: 'Guardado cancelado', life: 2200 })
+        return
+    }
+    try {
+        const res = await store.presupuestarSolicitud({ orderId: pending.orderId, payload: _payloadActual() }, decision.options)
+        const aviso = decision.options.skipNotification || !form.cliente_email
+            ? '(sin notificación)'
+            : '· avisando al cliente con el PDF…'
+        toast.add({
+            severity: 'success',
+            summary: `${pending.codigo || pending.orderId} presupuestado`,
+            detail: `${formatMoney(res.newPrice)} ${aviso}`,
+            life: 4000,
+        })
+    } catch (e) {
+        toast.add({ severity: 'error', summary: 'Error', detail: e.message, life: 5000 })
+    }
+}
+
 const saveOrder = async () => {
     if (!result.value) return
+    if (store.pendingWebQuote?.orderId && store.appData.orders.some((o) => o.id === store.pendingWebQuote.orderId)) {
+        return presupuestarSolicitud()
+    }
     const info = result.value.info || {}
     const clienteNorm = String(info.cliente || '').trim().toLowerCase()
     const descNorm = String(info.descripcion || '').trim().toLowerCase()
@@ -654,9 +704,9 @@ const saveOrder = async () => {
             acceptProps: { severity: 'warn' },
             accept: async () => {
                 try {
-                    const payload = JSON.parse(JSON.stringify({ ...form, material_breakdown: calcMixBreakdown, partner_printers: partnerPrintersPayload(), deterioro_impresora: 'Autofinanciación' }))
+                    const payload = JSON.parse(JSON.stringify({ ...form, material_breakdown: materialBreakdown(), partner_printers: partnerPrintersPayload(), deterioro_impresora: 'Autofinanciación' }))
                     const res = await store.recalculateOrder({ orderId: existing.id, payload })
-                    toast.add({ severity: 'success', summary: 'Pedido actualizado', detail: `#${existing.id} — nuevo precio: ${res.newPrice?.toFixed(2)} ${result.value.info?.unit || '€'}`, life: 4000 })
+                    toast.add({ severity: 'success', summary: 'Pedido actualizado', detail: `#${existing.id} — nuevo precio: ${formatMoney(res.newPrice)}`, life: 4000 })
                 } catch (e) {
                     toast.add({ severity: 'error', summary: 'Error', detail: e.message, life: 4000 })
                 }
@@ -670,7 +720,7 @@ const saveOrder = async () => {
                 const res = await store.saveOrderFromResult(result.value, decision.options)
                 if (decision.options.skipNotification) {
                     toast.add({ severity: 'info', summary: 'Guardado', detail: `Pedido #${res.order.id} (sin notificación).`, life: 3000 })
-                } else if (form.cliente_email && store.appData.global_config?.email_enabled) {
+                } else if (form.cliente_email && store.puedeAvisar()) {
                     toast.add({ severity: 'success', summary: 'Guardado', detail: `Pedido #${res.order.id} · Enviando email + PDF…`, life: 3500 })
                 } else {
                     toast.add({ severity: 'success', summary: 'Guardado', detail: `Pedido #${res.order.id}`, life: 3000 })
@@ -686,7 +736,7 @@ const saveOrder = async () => {
         const res = await store.saveOrderFromResult(result.value, decision.options)
         if (decision.options.skipNotification) {
             toast.add({ severity: 'info', summary: 'Guardado', detail: `Pedido #${res.order.id} (sin notificación).`, life: 3000 })
-        } else if (form.cliente_email && store.appData.global_config?.email_enabled) {
+        } else if (form.cliente_email && store.puedeAvisar()) {
             toast.add({ severity: 'success', summary: 'Guardado', detail: `Pedido #${res.order.id} · Enviando email + PDF…`, life: 3500 })
         } else {
             toast.add({ severity: 'success', summary: 'Guardado', detail: `Pedido #${res.order.id}`, life: 3000 })
@@ -767,13 +817,13 @@ const exportBothPdfs = async () => {
                     · precio estimado en la web: <strong>{{ formatMoney(store.pendingWebQuote.prefill.precio_web) }}</strong>
                 </template>
             </span>
-            <span class="text-xs text-surface-400 dark:text-white/30">al guardar el pedido quedará enlazado y la web se actualizará sola</span>
+            <span class="text-xs text-surface-400 dark:text-white/30">al guardar se actualiza su pedido y pasa a «Presupuesto enviado»</span>
             <Button label="Descartar" icon="pi pi-times" size="small" text severity="secondary" class="ml-auto" @click="descartarWebQuote" />
         </div>
 
         <div class="flex flex-col 2xl:flex-row gap-6">
             <!-- LEFT: Form -->
-            <div class="w-full 2xl:w-[420px] 2xl:shrink-0 flex flex-col gap-4 min-w-0">
+            <div class="w-full 2xl:w-[420px] 2xl:shrink-0 flex flex-col gap-4 min-w-0" @keydown.enter="onEnterCalcular">
                 <Panel header="Información del proyecto" toggleable :pt="{ root: { class: 'card rounded-2xl border-0 overflow-hidden' }, header: { class: '!bg-transparent border-b border-black/[0.05] dark:border-white/[0.06] px-4 py-3' }, content: { class: '!bg-transparent p-4' } }">
                     <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
                         <div class="flex flex-col gap-1 min-w-0">
@@ -848,16 +898,18 @@ const exportBothPdfs = async () => {
                             </Select>
                         </div>
                         <div class="flex flex-col gap-1 min-w-0">
-                            <label class="text-sm text-surface-400">Peso (g)</label>
-                            <InputNumber v-model="form.peso_g" :disabled="form.is_multimaterial" class="w-full" :pt="{ root: { class: 'w-full' }, input: { style: 'width:100%;min-width:0' } }" :invalid="!!errors.peso_g" />
+                            <label for="calc-peso" class="text-sm text-surface-400">Peso</label>
+                            <CampoNumero v-model="form.peso_g" input-id="calc-peso" :max-decimales="2" unidad="g" :disabled="form.is_multimaterial" :invalid="!!errors.peso_g" />
+                            <small v-if="errors.peso_g" class="text-red-500">{{ errors.peso_g }}</small>
                         </div>
                         <div class="flex flex-col gap-1 min-w-0">
-                            <label class="text-sm text-surface-400">Tiempo (h)</label>
-                            <InputNumber v-model="form.tiempo_h" :minFractionDigits="1" class="w-full" :pt="{ root: { class: 'w-full' }, input: { style: 'width:100%;min-width:0' } }" :invalid="!!errors.tiempo_h" />
+                            <label for="calc-tiempo" class="text-sm text-surface-400">Tiempo</label>
+                            <CampoTiempo v-model="form.tiempo_h" input-id="calc-tiempo" :invalid="!!errors.tiempo_h" />
+                            <small v-if="errors.tiempo_h" class="text-red-500">{{ errors.tiempo_h }}</small>
                         </div>
                         <div class="flex flex-col gap-1 min-w-0">
-                            <label class="text-sm text-surface-400">Cantidad (ud.)</label>
-                            <InputNumber v-model="form.cantidad" :min="1" :step="1" class="w-full" :pt="{ root: { class: 'w-full' }, input: { style: 'width:100%;min-width:0' } }" />
+                            <label for="calc-cantidad" class="text-sm text-surface-400">Cantidad</label>
+                            <CampoNumero v-model="form.cantidad" input-id="calc-cantidad" :min="1" unidad="ud." />
                         </div>
                     </div>
                     <small class="text-surface-400 mt-2 block">
@@ -894,11 +946,11 @@ const exportBothPdfs = async () => {
                             </div>
                             <div class="flex flex-col gap-1 overflow-hidden">
                                 <label v-if="idx === 0 || isHandheld" class="text-[11px] text-surface-400">Peso (g)</label>
-                                <InputNumber v-model="line.grams" placeholder="g" suffix=" g" :inputStyle="{ width: '100%', minWidth: '0' }" class="w-full [&_input]:!w-full [&_input]:!min-w-0" />
+                                <CampoNumero v-model="line.grams" :max-decimales="2" placeholder="g" />
                             </div>
                             <div class="flex flex-col gap-1 min-w-0">
                                 <label v-if="idx === 0 || isHandheld" class="text-[11px] text-surface-400">Gasto</label>
-                                <span class="text-xs font-mono font-semibold text-amber-600 dark:text-amber-400 py-2 text-right whitespace-nowrap">{{ mixLineCost(line).toFixed(2) }}{{ unit }}</span>
+                                <span class="text-xs font-mono font-semibold text-amber-600 dark:text-amber-400 py-2 text-right whitespace-nowrap">{{ formatMoney(mixLineCost(line)) }}</span>
                             </div>
                             <Button v-if="mixLines.length > 2" icon="pi pi-times" text severity="danger"
                                 :class="isHandheld ? 'col-span-2 !h-11' : 'mb-0.5 self-end'"
@@ -906,8 +958,8 @@ const exportBothPdfs = async () => {
                                 aria-label="Quitar color" @click="removeMixLine(idx)" v-tooltip.top="'Quitar'" />
                         </div>
                         <div class="flex items-center justify-between mt-2 pt-2 border-t border-amber-200 dark:border-amber-700">
-                            <span class="text-xs text-surface-500">Total: <strong>{{ mixTotalGrams.toFixed(0) }} g</strong></span>
-                            <span class="text-sm font-mono font-bold text-amber-600 dark:text-amber-400">{{ mixTotalCost.toFixed(2) }} {{ unit }}</span>
+                            <span class="text-xs text-surface-500">Total: <strong>{{ formatNumero(mixTotalGrams) }} g</strong></span>
+                            <span class="text-sm font-mono font-bold text-amber-600 dark:text-amber-400">{{ formatMoney(mixTotalCost) }}</span>
                         </div>
                     </div>
                     <small v-if="filamentPrice" class="text-surface-400 mt-1 block">
@@ -935,11 +987,9 @@ const exportBothPdfs = async () => {
                                     </div>
                                 </template>
                             </Select>
-                            <div v-if="esDisenoAMedida" class="flex items-center gap-2 mt-1">
-                                <InputNumber v-model="form.diseno_horas" :min="0" :step="0.25" :minFractionDigits="0" :maxFractionDigits="2"
-                                    suffix=" h" showButtons buttonLayout="horizontal" class="w-40"
-                                    incrementButtonIcon="pi pi-plus" decrementButtonIcon="pi pi-minus" />
-                                <span class="text-xs text-surface-400">× {{ formatMoney(laborCostH) }}/h = <strong class="text-amber-600 dark:text-amber-400">{{ formatMoney(disenoTarifa) }}</strong></span>
+                            <div v-if="esDisenoAMedida" class="flex items-start gap-2 mt-1">
+                                <CampoTiempo v-model="form.diseno_horas" class="w-40 shrink-0" />
+                                <span class="text-xs text-surface-400 pt-2.5">× {{ formatMoney(laborCostH) }}/h = <strong class="text-amber-600 dark:text-amber-400">{{ formatMoney(disenoTarifa) }}</strong></span>
                             </div>
                             <small class="text-surface-400">Se cobra una sola vez por pedido, sean 1 o 50 piezas.</small>
                         </div>
@@ -1000,9 +1050,8 @@ const exportBothPdfs = async () => {
                             <label class="text-sm text-surface-400 flex items-center gap-1">
                                 <i class="pi pi-tag text-xs" /> Extras / Misceláneos
                             </label>
-                            <InputNumber v-model="form.gasto_misc" :min="0" :minFractionDigits="2" :maxFractionDigits="2"
-                                class="w-full" placeholder="Anillas, llaveros, embalaje..." />
-                            <small class="text-surface-400">Importe directo añadido al precio final (sin markup)</small>
+                            <CampoNumero v-model="form.gasto_misc" :min-decimales="2" :max-decimales="2" :unidad="unit" />
+                            <small class="text-surface-400">Anillas, llaveros, embalaje… Importe directo añadido al precio final (sin markup)</small>
                         </div>
                     </div>
                 </Panel>
@@ -1019,16 +1068,16 @@ const exportBothPdfs = async () => {
                         <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
                             <div class="bg-primary-50 dark:bg-primary-950/30 border border-primary-200 dark:border-primary-800 rounded-xl p-4 text-center">
                                 <div class="text-xs text-primary-600 dark:text-primary-400 font-semibold uppercase tracking-wide">Precio Total</div>
-                                <div class="text-2xl font-bold text-primary-700 dark:text-primary-300 mt-1">{{ summaryMetrics.precioFinal.toFixed(2) }} {{ unit }}</div>
-                                <div v-if="summaryMetrics.cantidad > 1" class="text-xs text-primary-500 mt-1">{{ summaryMetrics.cantidad }} ud. × {{ summaryMetrics.precioUnitario.toFixed(2) }} {{ unit }}/ud.</div>
+                                <div class="text-2xl font-bold text-primary-700 dark:text-primary-300 mt-1">{{ formatMoney(summaryMetrics.precioFinal) }}</div>
+                                <div v-if="summaryMetrics.cantidad > 1" class="text-xs text-primary-500 mt-1">{{ summaryMetrics.cantidad }} ud. × {{ formatMoney(summaryMetrics.precioUnitario) }}/ud.</div>
                             </div>
                             <div class="bg-green-50 dark:bg-green-950/30 border border-green-200 dark:border-green-800 rounded-xl p-4 text-center">
                                 <div class="text-xs text-green-600 dark:text-green-400 font-semibold uppercase tracking-wide">Beneficio</div>
-                                <div class="text-2xl font-bold text-green-700 dark:text-green-300 mt-1">{{ summaryMetrics.beneficioNeto.toFixed(2) }} {{ unit }}</div>
+                                <div class="text-2xl font-bold text-green-700 dark:text-green-300 mt-1">{{ formatMoney(summaryMetrics.beneficioNeto) }}</div>
                             </div>
                             <div class="card-inset rounded-xl p-4 text-center">
                                 <div class="text-xs text-surface-500 font-semibold uppercase tracking-wide">Coste Bruto</div>
-                                <div class="text-2xl font-bold mt-1">{{ summaryMetrics.costeBruto.toFixed(2) }} {{ unit }}</div>
+                                <div class="text-2xl font-bold mt-1">{{ formatMoney(summaryMetrics.costeBruto) }}</div>
                             </div>
                         </div>
                     </div>
@@ -1042,11 +1091,11 @@ const exportBothPdfs = async () => {
                         <div class="grid grid-cols-2 gap-4">
                             <div class="text-center p-3 bg-blue-50 dark:bg-blue-950/30 rounded-lg border border-blue-200 dark:border-blue-800">
                                 <div class="text-xs font-semibold text-blue-500 uppercase">3DCC ({{ result.info.shared_split['3DCC'] }}%)</div>
-                                <div class="text-xl font-bold text-blue-600 dark:text-blue-400 mt-1">{{ (result.info.precio_final * result.info.shared_split['3DCC'] / 100).toFixed(2) }} {{ unit }}</div>
+                                <div class="text-xl font-bold text-blue-600 dark:text-blue-400 mt-1">{{ formatMoney(result.info.precio_final * result.info.shared_split['3DCC'] / 100) }}</div>
                             </div>
                             <div class="text-center p-3 bg-purple-50 dark:bg-purple-950/30 rounded-lg border border-purple-200 dark:border-purple-800">
                                 <div class="text-xs font-semibold text-purple-500 uppercase">SILAB3D ({{ result.info.shared_split['SILAB3D'] }}%)</div>
-                                <div class="text-xl font-bold text-purple-600 dark:text-purple-400 mt-1">{{ (result.info.precio_final * result.info.shared_split['SILAB3D'] / 100).toFixed(2) }} {{ unit }}</div>
+                                <div class="text-xl font-bold text-purple-600 dark:text-purple-400 mt-1">{{ formatMoney(result.info.precio_final * result.info.shared_split['SILAB3D'] / 100) }}</div>
                             </div>
                         </div>
                     </div>
@@ -1097,7 +1146,7 @@ const exportBothPdfs = async () => {
                                 </div>
                                 <div class="px-3 py-1">
                                     <div class="flex justify-between items-center py-2 border-b border-black/[0.04] dark:border-white/[0.06]">
-                                        <span class="text-surface-600 dark:text-surface-300">Suplemento markup (×{{ (detailedBreakdown?.markup || 2.3).toFixed(2) }})</span>
+                                        <span class="text-surface-600 dark:text-surface-300">Suplemento markup (×{{ moneyFormatter.format(detailedBreakdown?.markup || 2.3) }})</span>
                                         <span class="font-mono font-semibold text-green-600 dark:text-green-400">+{{ formatMoney(detailedBreakdown?.markupSupplement || 0) }}</span>
                                     </div>
                                     <div class="flex justify-between items-center py-2 border-b border-black/[0.04] dark:border-white/[0.06]">

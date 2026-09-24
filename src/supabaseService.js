@@ -11,6 +11,16 @@
  * ────────────────────────────────────────
  *   empresa_docs (empresa, doc, data)   doc ∈ config | inventory | clients | calc_state
  *   orders       (empresa, id, data)    el pedido completo vive en `data`
+ *
+ * Sincronización con la web (migraciones 0026-0028)
+ * ─────────────────────────────────────────────────
+ *   · Cada pedido de 3DCC tiene su quote (el registro que ve el cliente) y
+ *     cada solicitud del tasador llega ya como pedido en 'Nuevo'.
+ *   · El estado viaja en los dos sentidos; si guardas una copia vieja de un
+ *     pedido, el servidor conserva el estado más reciente.
+ *   · El dinero sale del libro `cobros`: importe_pagado, payment_status y
+ *     payment_history los recalcula el servidor en cada guardado. Por eso
+ *     saveOrder devuelve el pedido tal y como quedó allí.
  */
 
 import { supabase, supabaseUrl } from './supabase'
@@ -36,6 +46,8 @@ function _cleanOrder(order) {
   delete data._fromPartner
   delete data._empresaOwner
   delete data._webCodigo
+  // El enlace vive en la columna orders.quote_id, no en el JSON.
+  delete data.quote_id
   return data
 }
 
@@ -84,11 +96,7 @@ export async function loadAllData(empresaName) {
   const inv = docs.inventory || {}
   const cl  = docs.clients || {}
   const cs  = Object.prototype.hasOwnProperty.call(docs, 'calc_state') ? docs.calc_state : null
-  const orders = (ordersRes.data || []).map((r) => ({
-    ...r.data,
-    id: r.id,
-    ...(r.quote_id ? { quote_id: r.quote_id, _webCodigo: r.quotes?.codigo || '' } : {}),
-  }))
+  const orders = (ordersRes.data || []).map(_rowToOrder)
 
   return {
     printers: cfg.printers || null,
@@ -125,12 +133,81 @@ export async function saveClients(empresaName, clients) {
   await _upsertDoc(empresaSlug(empresaName), 'clients', { clients })
 }
 
+/** Fila de orders → pedido en memoria (mismos tags que loadAllData). */
+function _rowToOrder(r) {
+  return {
+    ...r.data,
+    id: r.id,
+    ...(r.quote_id ? { quote_id: r.quote_id, _webCodigo: r.quotes?.codigo || '' } : {}),
+  }
+}
+
+/**
+ * Guarda el pedido y devuelve cómo quedó en el servidor: los triggers pueden
+ * haber recalculado el dinero (libro de cobros), conservado un estado más
+ * reciente puesto desde la web o creado su quote.
+ */
 export async function saveOrder(empresaName, order) {
   const slug = empresaSlug(empresaName)
-  const { error } = await supabase
+  const { data, error } = await supabase
     .from('orders')
     .upsert({ empresa: slug, id: String(order.id), data: _cleanOrder(order) }, { onConflict: 'empresa,id' })
+    .select('id, data, quote_id, quotes ( codigo )')
+    .maybeSingle()
   _throw(error, `guardando pedido ${order.id} de ${slug}`)
+  return data ? _rowToOrder(data) : null
+}
+
+/** Relee un pedido del servidor. */
+export async function loadOrder(empresaName, orderId) {
+  const slug = empresaSlug(empresaName)
+  const { data, error } = await supabase
+    .from('orders')
+    .select('id, data, quote_id, quotes ( codigo )')
+    .eq('empresa', slug)
+    .eq('id', String(orderId))
+    .maybeSingle()
+  _throw(error, `cargando pedido ${orderId} de ${slug}`)
+  return data ? _rowToOrder(data) : null
+}
+
+/* ── Libro de cobros (migración 0028) ───────────────────────────────────── */
+
+/**
+ * Anula un cobro. `paymentId` es el id que ve la app en payment_history (el
+ * del apunte original o el del libro). Quitarlo del JSON no basta: el
+ * servidor no borra cobros por una copia del pedido que no los trae.
+ */
+export async function anularCobro(empresaName, orderId, paymentId, motivo = '') {
+  const { data, error } = await supabase.rpc('anular_cobro', {
+    p_empresa: empresaSlug(empresaName),
+    p_order_id: String(orderId),
+    p_payment_id: String(paymentId),
+    p_motivo: motivo,
+  })
+  _throw(error, 'anulando cobro')
+  return !!data
+}
+
+/**
+ * Justificante PDF de un cobro (Edge Function recibo-emitir), el mismo que
+ * emite la web. Opcional.
+ */
+export async function emitirJustificante(cobroId, { enviarEmail = false, concepto = '' } = {}) {
+  const { data, error } = await supabase.functions.invoke('recibo-emitir', {
+    body: { action: 'emitir', cobro_id: cobroId, enviar_email: enviarEmail, concepto },
+  })
+  if (error) return { ok: false, error: await _detalle(error) }
+  if (data?.error) return { ok: false, error: data.error }
+  return { ok: true, ...(data || {}) }
+}
+
+async function _detalle(error) {
+  try {
+    const j = await error.context?.json?.()
+    if (j?.error) return j.error
+  } catch { /* sin detalle */ }
+  return error.message
 }
 
 export async function removeOrder(empresaName, orderId) {
@@ -206,26 +283,23 @@ export async function savePartnerInventory(currentEmpresa, filament_stock) {
   }
 }
 
-/* ── Presupuestos web (bandeja 3DCC, fase 2) ────────────────────────────── */
+/* ── Solicitudes web (bandeja 3DCC) ─────────────────────────────────────── */
 
 /**
- * Solicitudes activas del tasador web sin pedido enlazado todavía.
+ * Datos de las quotes de unos pedidos (archivos, mensaje, entrega…) para la
+ * bandeja de solicitudes. Los pedidos en sí ya están en appData: Supabase
+ * los crea al llegar la solicitud (0027).
  * RLS: solo visible para usuarios de 3DCC (migración 0017).
  */
-export async function loadWebQuotes() {
-  const [quotesRes, linksRes] = await Promise.all([
-    supabase
-      .from('quotes')
-      .select('id, codigo, estado, nombre, email, telefono, material, colores, cantidad, entrega, archivos, metricas, precio_total, precio_final, valido_hasta, created_at')
-      .in('estado', ['nuevo', 'revisado', 'aceptado'])
-      .eq('archivado', false)
-      .order('created_at', { ascending: false }),
-    supabase.from('orders').select('quote_id').not('quote_id', 'is', null),
-  ])
-  _throw(quotesRes.error, 'cargando presupuestos web')
-  _throw(linksRes.error, 'cargando enlaces pedido-presupuesto')
-  const linked = new Set((linksRes.data || []).map((r) => r.quote_id))
-  return (quotesRes.data || []).filter((q) => !linked.has(q.id))
+export async function loadQuotesByIds(ids) {
+  const lista = [...new Set((ids || []).filter(Boolean))]
+  if (!lista.length) return []
+  const { data, error } = await supabase
+    .from('quotes')
+    .select('id, codigo, estado, nombre, email, telefono, mensaje, material, colores, cantidad, entrega, direccion, archivos, metricas, precio_total, precio_final, valido_hasta, created_at')
+    .in('id', lista)
+  _throw(error, 'cargando solicitudes web')
+  return data || []
 }
 
 /**
@@ -255,35 +329,26 @@ export async function rejectWebQuote(quoteId) {
 
 /**
  * Avisa al cliente por email con la plantilla web del estado actual de su
- * quote (edge function notify-quote). Funciona en escritorio y móvil.
+ * pedido (edge function notify-quote). Es el canal de correo de 3DCC en
+ * escritorio y móvil: mismas plantillas y remitente que la web, sin
+ * contraseñas en la app. `adjunto` = { filename, base64 } (PDF, opcional).
  */
-export async function notifyWebQuote(quoteId) {
-  const { data, error } = await supabase.functions.invoke('notify-quote', {
-    body: { quote_id: quoteId },
+export async function notifyOrder(empresaName, orderId, adjunto = null) {
+  return _invokeNotify({
+    empresa: empresaSlug(empresaName),
+    order_id: String(orderId),
+    ...(adjunto ? { adjunto } : {}),
   })
-  if (error) {
-    let detail = error.message
-    try {
-      const j = await error.context?.json?.()
-      if (j?.error) detail = j.error
-    } catch { /* sin detalle */ }
-    return { ok: false, error: detail }
-  }
-  return { ok: true, ...(data || {}) }
 }
 
-/**
- * Enlaza un pedido con una solicitud web. A partir de aquí el trigger
- * project_order_to_quote mantiene la quote sincronizada con el pedido.
- * saveOrder nunca toca la columna quote_id, así que el enlace persiste.
- */
-export async function linkOrderToQuote(empresaName, orderId, quoteId) {
-  const { error } = await supabase
-    .from('orders')
-    .update({ quote_id: quoteId })
-    .eq('empresa', empresaSlug(empresaName))
-    .eq('id', String(orderId))
-  _throw(error, `enlazando pedido ${orderId} con presupuesto web`)
+export async function notifyWebQuote(quoteId) {
+  return _invokeNotify({ quote_id: quoteId })
+}
+
+async function _invokeNotify(body) {
+  const { data, error } = await supabase.functions.invoke('notify-quote', { body })
+  if (error) return { ok: false, error: await _detalle(error) }
+  return { ok: true, ...(data || {}) }
 }
 
 /**

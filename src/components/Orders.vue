@@ -1,6 +1,7 @@
 <script setup>
 import { computed, reactive, ref, watch } from 'vue'
 import { store } from '../store'
+import * as fsService from '../supabaseService'
 import { api } from '../platform'
 import DataTable from 'primevue/datatable'
 import Column from 'primevue/column'
@@ -8,7 +9,6 @@ import Button from 'primevue/button'
 import Tag from 'primevue/tag'
 import Dialog from 'primevue/dialog'
 import InputText from 'primevue/inputtext'
-import InputNumber from 'primevue/inputnumber'
 import Textarea from 'primevue/textarea'
 import Select from 'primevue/select'
 import Slider from 'primevue/slider'
@@ -20,9 +20,12 @@ import { useConfirm } from 'primevue/useconfirm'
 import OrderPurgeTable from './OrderPurgeTable.vue'
 import EmailNotifyDialog from './EmailNotifyDialog.vue'
 import WebQuotesInbox from './WebQuotesInbox.vue'
+import CampoNumero from './CampoNumero.vue'
+import CampoTiempo from './CampoTiempo.vue'
 import { useEmailConfirm } from '../composables/useEmailConfirm'
 import { useStaleOrders } from '../composables/useStaleOrders'
-import { laborOptions, DISENO_A_MEDIDA, MARKUP } from '../shared/backend.mjs'
+import { laborOptions, disenoCostH, DISENO_A_MEDIDA, MARKUP } from '../shared/backend.mjs'
+import { formatNumero, formatHoras } from '../shared/formatos.mjs'
 import { useIsHandheld } from '../composables/useMediaQuery'
 
 const selectedOrder = ref()
@@ -30,6 +33,23 @@ const selectedOrder = ref()
 /* Móvil y escritorio montan listas distintas, no la misma escondida con CSS. */
 const isHandheld = useIsHandheld()
 const cardLimit = ref(20)
+
+/* Cada dispositivo se queda con la foto que cargó al abrir: sin esto, lo que
+ * archivas en el móvil no aparece en el PC hasta reiniciarlo. */
+const recargando = ref(false)
+const recargar = async () => {
+    if (recargando.value) return
+    recargando.value = true
+    try {
+        await store.refresh()
+        selectedOrder.value = null
+        toast.add({ severity: 'success', summary: 'Datos actualizados', life: 1800 })
+    } catch (e) {
+        toast.add({ severity: 'error', summary: 'No se pudo recargar', detail: e.message, life: 5000 })
+    } finally {
+        recargando.value = false
+    }
+}
 const ordersForCards = computed(() => ordersForTable.value.slice(0, cardLimit.value))
 
 /* Señales que en la tabla eran iconos sueltos de 12 px imposibles de acertar. */
@@ -80,13 +100,16 @@ const compactMode = ref(localStorage.getItem('orders_compact') === 'true')
 const pendingDelete = reactive({ order: null, timer: null })
 
 const PAYMENT_METHODS = ['Efectivo', 'Bizum', 'Transferencia', 'Stripe', 'Otro']
+// Mismo orden que pedido_estados en Supabase (vocabulario común con la web).
 const ORDER_STATUS = [
+    'Nuevo',
     'Presupuesto enviado',
     'Aceptado',
     'En producción',
     'Post-procesado',
     'Listo para entregar',
     'Entregado',
+    'Descartado',
 ]
 
 const orders = computed(() => store.appData.orders)
@@ -101,7 +124,8 @@ const beneficioReal = computed(() => {
 const total = computed(() => orders.value.length)
 const archivedCount = computed(() => orders.value.filter(o => o.archived).length)
 const activosCount = computed(() => orders.value.filter(o => !o.archived).length)
-const pendientesCount = computed(() => orders.value.filter(o => !o.archived && ['Presupuesto enviado', 'Enviado'].includes(o.estado)).length)
+const pendientesCount = computed(() => orders.value.filter(o => !o.archived && ['Nuevo', 'Presupuesto enviado', 'Enviado'].includes(o.estado)).length)
+const descartadosCount = computed(() => orders.value.filter(o => o.estado === 'Descartado').length)
 const enProduccionCount = computed(() => orders.value.filter(o => !o.archived && ['Aceptado', 'En producción', 'Post-procesado', 'Listo para entregar'].includes(o.estado)).length)
 
 const parseFechaTsRobust = (o) => {
@@ -412,6 +436,7 @@ const paymentSeverity = (status) => {
 
 const getSeverity = (status) => {
     const map = {
+        'Nuevo': 'contrast',
         'Presupuesto enviado': 'info',
         'Enviado': 'info',
         'Aceptado': 'success',
@@ -419,6 +444,7 @@ const getSeverity = (status) => {
         'Post-procesado': 'help',
         'Listo para entregar': 'info',
         'Entregado': 'success',
+        'Descartado': 'secondary',
     }
     return map[status] || 'secondary'
 }
@@ -438,8 +464,9 @@ const closeDetail = () => {
 }
 
 const _maybeAskEmailFor = async (order, newStatus, title) => {
-    const emailEnabled = !!store.appData.global_config?.email_enabled
-    if (!emailEnabled || !order?.cliente_email || order.estado === newStatus) return { proceed: true, options: {} }
+    const emailEnabled = store.puedeAvisar(order)
+    // Descartar nunca avisa (limpieza interna), así que no se pregunta.
+    if (!emailEnabled || !order?.cliente_email || order.estado === newStatus || newStatus === 'Descartado') return { proceed: true, options: {} }
     const choice = await askEmailConfirm({
         order: { ...order, estado: newStatus },
         oldStatus: order.estado,
@@ -504,8 +531,8 @@ const quickChangeStatus = async (order, newStatus) => {
             }
         }, decision.options)
 
-        const emailEnabled = !!store.appData.global_config?.email_enabled
-        const willEmail = emailEnabled && !!order.cliente_email && !decision.options.skipNotification
+        const emailEnabled = store.puedeAvisar(order)
+        const willEmail = emailEnabled && !!order.cliente_email && !decision.options.skipNotification && newStatus !== 'Descartado'
         
         if (shouldAutoArchive) {
             toast.add({ severity: 'success', summary: 'Pedido archivado', detail: 'Totalmente pagado automáticamente', life: 3500 })
@@ -641,11 +668,45 @@ const removeImage = () => {
     imageDataUrl.value = ''
 }
 
+/* Justificante PDF de un cobro: el mismo que emite la web (recibo-emitir). */
+const emitiendo = ref(null)
+const emitirJustificante = (payment) => {
+    const order = selectedOrder.value
+    if (!payment?.cobro_id || !order) return
+    confirmDlg.require({
+        message: order.cliente_email
+            ? `Se archivará el justificante de ${fmt(payment.amount)} y se enviará a ${order.cliente_email}. Una vez emitido solo se puede anular.`
+            : `Se archivará el justificante de ${fmt(payment.amount)} (el pedido no tiene email: descárgalo desde la web). Una vez emitido solo se puede anular.`,
+        header: 'Emitir justificante',
+        icon: 'pi pi-file-pdf',
+        rejectLabel: 'Cancelar',
+        acceptLabel: 'Emitir',
+        accept: async () => {
+            emitiendo.value = payment.cobro_id
+            try {
+                const res = await fsService.emitirJustificante(payment.cobro_id, { enviarEmail: !!order.cliente_email })
+                if (!res.ok) throw new Error(res.error)
+                toast.add({
+                    severity: res.aviso ? 'warn' : 'success',
+                    summary: `Justificante ${res.codigo}`,
+                    detail: res.aviso || (res.enviado ? `Enviado a ${order.cliente_email}` : 'Archivado'),
+                    life: 5000,
+                })
+                if (res.url) api.openUrl(res.url)
+            } catch (e) {
+                toast.add({ severity: 'error', summary: 'No se pudo emitir', detail: e.message, life: 5000 })
+            } finally {
+                emitiendo.value = null
+            }
+        },
+    })
+}
+
 const removePaymentRecord = async (payment) => {
     const orderId = selectedOrder.value?.id
     if (!orderId || !payment?.id) return
     confirmDlg.require({
-        message: '¿Eliminar este movimiento de cobro?',
+        message: '¿Anular este cobro? Deja de contar aquí y en la web; queda registrado como anulado.',
         header: 'Confirmar',
         icon: 'pi pi-exclamation-triangle',
         rejectLabel: 'Cancelar',
@@ -662,7 +723,7 @@ const removePaymentRecord = async (payment) => {
                     syncSelection(orderId)
                     toast.add({ severity: 'warn', summary: 'Pedido recuperado', detail: 'Pago incompleto — el pedido se ha desarchivado', life: 3000 })
                 } else {
-                    toast.add({ severity: 'success', summary: 'Movimiento eliminado', detail: 'El pedido se recalculó automáticamente', life: 2600 })
+                    toast.add({ severity: 'success', summary: 'Cobro anulado', detail: 'El pedido se recalculó automáticamente', life: 2600 })
                 }
             } catch (e) {
                 toast.add({ severity: 'error', summary: 'Error', detail: e.message, life: 3500 })
@@ -733,7 +794,7 @@ const saveOrderEdits = async () => {
     try {
         const oldStatus = selectedOrder.value.estado
         const statusChanged = oldStatus !== detail.estado
-        const emailEnabled = !!store.appData.global_config?.email_enabled
+        const emailEnabled = store.puedeAvisar(selectedOrder.value) && detail.estado !== 'Descartado'
 
         // Ask for confirmation if status changed and we'd send an email
         let storeOptions = {}
@@ -855,7 +916,7 @@ const exportBothOrderPdfs = async () => {
 /* ── Modify order (recalculate) ──────────────────────────────────────── */
 
 const editTarifas = computed(() => laborOptions(store.appData.global_config))
-const editLaborCostH = computed(() => Number(store.appData.global_config.labor_cost_h || 0))
+const editLaborCostH = computed(() => disenoCostH(store.appData.global_config))
 const editEsDisenoAMedida = computed(() => editForm.diseno_modelado === DISENO_A_MEDIDA)
 const editCantidadUds = computed(() => Math.max(1, Math.floor(Number(editForm.cantidad) || 1)))
 const editMarkupOptions = computed(() => Object.keys(MARKUP))
@@ -1164,8 +1225,9 @@ const saveModify = async () => {
                 outlined class="!w-11 !h-11 shrink-0"
                 @click="toggleShowArchived"
             />
-            <Button icon="pi pi-file-export" severity="secondary" outlined class="!w-11 !h-11 shrink-0"
-                aria-label="Exportar CSV" @click="exportCsv" />
+            <Button :icon="recargando ? 'pi pi-spin pi-spinner' : 'pi pi-refresh'" severity="secondary" outlined
+                class="!w-11 !h-11 shrink-0" aria-label="Recargar desde el servidor"
+                :disabled="recargando" @click="recargar" />
         </div>
 
         <!-- ═══ Toolbar (escritorio) ═══ -->
@@ -1193,6 +1255,8 @@ const saveModify = async () => {
                 <Divider layout="vertical" class="mx-1 !h-6 self-center" />
                 <Button :icon="compactMode ? 'pi pi-expand' : 'pi pi-compress'" severity="secondary" size="small" rounded text v-tooltip.bottom="compactMode ? 'Vista normal' : 'Vista compacta'" @click="toggleCompact" />
                 <Button icon="pi pi-file-export" severity="secondary" size="small" rounded text v-tooltip.bottom="'Exportar CSV'" @click="exportCsv" />
+                <Button :icon="recargando ? 'pi pi-spin pi-spinner' : 'pi pi-refresh'" severity="secondary" size="small" rounded text
+                    v-tooltip.bottom="'Recargar desde el servidor'" :disabled="recargando" @click="recargar" />
             </div>
             <div class="flex items-center gap-2">
                 <Button
@@ -1500,7 +1564,7 @@ const saveModify = async () => {
                                 <span class="text-surface-400 normal-case font-normal">— opcional, para recibir notificaciones</span>
                             </label>
                             <InputText v-model="detail.cliente_email" type="email" placeholder="cliente@ejemplo.com" class="w-full" size="small" :disabled="isPartnerOrder" />
-                            <small v-if="detail.cliente_email && !store.appData.global_config?.email_enabled" class="text-amber-500">
+                            <small v-if="detail.cliente_email && !store.puedeAvisar(selectedOrder)" class="text-amber-500">
                                 <i class="pi pi-exclamation-triangle text-[10px] mr-1" />Las notificaciones por email están desactivadas en Configuración.
                             </small>
                             <small v-else-if="detail.cliente_email" class="text-surface-400">
@@ -1521,7 +1585,7 @@ const saveModify = async () => {
                         </div>
                         <div class="flex flex-col gap-1 col-span-full min-w-0">
                             <label class="text-[10px] text-surface-500 uppercase tracking-wider font-semibold">Repeticiones por error</label>
-                            <InputNumber v-model="detail.repeticiones_error" :min="0" :step="1" class="w-32" size="small" :disabled="isPartnerOrder" inputClass="text-center" v-tooltip.top="'Nº de reimpresiones por fallo (para estadísticas reales)'" />
+                            <CampoNumero v-model="detail.repeticiones_error" class="w-32" size="small" :disabled="isPartnerOrder" input-class="text-center" v-tooltip.top="'Nº de reimpresiones por fallo (para estadísticas reales)'" />
                         </div>
                         <div class="flex flex-col gap-1 col-span-full min-w-0">
                             <label class="text-[10px] text-surface-500 uppercase tracking-wider font-semibold">Notas internas</label>
@@ -1550,7 +1614,7 @@ const saveModify = async () => {
                         <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
                             <div class="flex flex-col gap-1 min-w-0">
                                 <label class="text-[10px] text-surface-500 uppercase tracking-wider font-semibold">Cobrado total</label>
-                                <InputNumber v-model="detail.importe_pagado" :min="0" :minFractionDigits="2" :maxFractionDigits="2" class="w-full" size="small" />
+                                <CampoNumero v-model="detail.importe_pagado" :min-decimales="2" :max-decimales="2" :unidad="unit" size="small" />
                             </div>
                             <div class="flex flex-col gap-1 min-w-0">
                                 <label class="text-[10px] text-surface-500 uppercase tracking-wider font-semibold">Método</label>
@@ -1623,7 +1687,7 @@ const saveModify = async () => {
                                 <span class="text-right text-surface-600 dark:text-surface-300 truncate">{{ selectedOrder.filamento || '—' }} ({{ selectedOrder.filamento_color || '—' }}) · {{ selectedOrder.peso_g }} g</span>
                                 <span class="font-medium text-right">{{ fmt(bdCost('Filamento')) }}</span>
                                 <span class="text-surface-400">Electricidad</span>
-                                <span class="text-right text-surface-600 dark:text-surface-300 truncate">{{ selectedOrder.horas }} h</span>
+                                <span class="text-right text-surface-600 dark:text-surface-300 truncate">{{ formatHoras(selectedOrder.horas) }}</span>
                                 <span class="font-medium text-right">{{ fmt(bdCost('Electricidad')) }}</span>
                                 <span class="text-surface-400">Impresora</span>
                                 <span class="text-right text-surface-600 dark:text-surface-300 truncate">{{ selectedOrder.impresora || '—' }}</span>
@@ -1710,8 +1774,12 @@ const saveModify = async () => {
                                     <div v-if="ev.ts" class="text-[10px] text-surface-400">{{ fmtDate(ev.ts) }}</div>
                                     <div v-if="ev.note" class="text-[10px] text-surface-400 truncate" :title="ev.note">{{ ev.note }}</div>
                                 </div>
+                                <Button v-if="ev.payment?.cobro_id && Number(ev.payment.amount) > 0 && store.empresa === '3DCC' && !isPartnerOrder"
+                                    icon="pi pi-file-pdf" severity="secondary" text size="small" rounded class="!w-6 !h-6 shrink-0"
+                                    :loading="emitiendo === ev.payment.cobro_id"
+                                    @click="emitirJustificante(ev.payment)" v-tooltip.left="'Emitir justificante PDF'" />
                                 <Button v-if="ev.payment" icon="pi pi-times" severity="danger" text size="small" rounded class="!w-6 !h-6 shrink-0"
-                                    @click="removePaymentRecord(ev.payment)" :disabled="isPartnerOrder" v-tooltip.left="'Eliminar cobro'" />
+                                    @click="removePaymentRecord(ev.payment)" :disabled="isPartnerOrder" v-tooltip.left="'Anular cobro'" />
                             </div>
                         </div>
                     </div>
@@ -1723,7 +1791,7 @@ const saveModify = async () => {
                             <span class="text-surface-400">{{ selectedOrder.notif_history?.length || 0 }}</span>
                         </div>
                         <div v-if="!selectedOrder.notif_history?.length" class="px-3 py-3 text-xs text-surface-400 text-center">
-                            Aún no se ha enviado ningún email. Se mandará automáticamente al cambiar de estado.
+                            Aún no se ha enviado ningún email. Al cambiar de estado se te preguntará si avisar al cliente.
                         </div>
                         <div v-else class="max-h-32 overflow-auto divide-y divide-black/[0.04] dark:divide-white/[0.06]">
                             <div v-for="(n, i) in selectedOrder.notif_history" :key="i" class="px-3 py-2 text-xs">
@@ -1867,16 +1935,16 @@ const saveModify = async () => {
                                 </Select>
                             </div>
                             <div class="flex flex-col gap-1 min-w-0">
-                                <label class="text-xs text-surface-400">Peso (g)</label>
-                                <InputNumber v-model="editForm.peso_g" :disabled="editForm.is_multimaterial" class="w-full" />
+                                <label class="text-xs text-surface-400">Peso</label>
+                                <CampoNumero v-model="editForm.peso_g" :max-decimales="2" unidad="g" :disabled="editForm.is_multimaterial" />
                             </div>
                             <div class="flex flex-col gap-1 min-w-0">
-                                <label class="text-xs text-surface-400">Tiempo (h)</label>
-                                <InputNumber v-model="editForm.tiempo_h" :minFractionDigits="1" class="w-full" />
+                                <label class="text-xs text-surface-400">Tiempo</label>
+                                <CampoTiempo v-model="editForm.tiempo_h" />
                             </div>
                             <div class="flex flex-col gap-1 min-w-0">
-                                <label class="text-xs text-surface-400">Cantidad (ud.)</label>
-                                <InputNumber v-model="editForm.cantidad" :min="1" :step="1" class="w-full" />
+                                <label class="text-xs text-surface-400">Cantidad</label>
+                                <CampoNumero v-model="editForm.cantidad" :min="1" unidad="ud." />
                             </div>
                         </div>
                         <div class="flex items-center gap-3 mt-3 p-2 bg-surface-100 dark:bg-surface-800 rounded-lg">
@@ -1906,7 +1974,7 @@ const saveModify = async () => {
                                 </div>
                                 <div class="flex flex-col gap-1 w-20">
                                     <label v-if="idx === 0" class="text-[11px] text-surface-400">Peso (g)</label>
-                                    <InputNumber v-model="line.grams" placeholder="g" suffix=" g" class="w-full" />
+                                    <CampoNumero v-model="line.grams" :max-decimales="2" placeholder="g" />
                                 </div>
                                 <div class="flex flex-col gap-1 w-20 shrink-0">
                                     <label v-if="idx === 0" class="text-[11px] text-surface-400">Gasto</label>
@@ -1915,7 +1983,7 @@ const saveModify = async () => {
                                 <Button v-if="editMixLines.length > 2" icon="pi pi-times" size="small" text severity="danger" class="shrink-0 mb-0.5" @click="removeEditMixLine(idx)" v-tooltip.top="'Quitar'" />
                             </div>
                             <div class="flex items-center justify-between mt-2 pt-2 border-t border-amber-200 dark:border-amber-700">
-                                <span class="text-xs text-surface-500">Total: <strong>{{ editMixTotalGrams.toFixed(0) }} g</strong></span>
+                                <span class="text-xs text-surface-500">Total: <strong>{{ formatNumero(editMixTotalGrams) }} g</strong></span>
                                 <span class="text-sm font-mono font-bold text-amber-600 dark:text-amber-400">{{ editMixTotalCost.toFixed(2) }} {{ editUnit }}</span>
                             </div>
                         </div>
@@ -1942,8 +2010,7 @@ const saveModify = async () => {
                                         </div>
                                     </template>
                                 </Select>
-                                <InputNumber v-if="editEsDisenoAMedida" v-model="editForm.diseno_horas" :min="0" :step="0.25"
-                                    :minFractionDigits="0" :maxFractionDigits="2" suffix=" h" class="w-full mt-1" />
+                                <CampoTiempo v-if="editEsDisenoAMedida" v-model="editForm.diseno_horas" class="mt-1" />
                             </div>
                             <div class="flex flex-col gap-1 col-span-full min-w-0">
                                 <label class="text-xs text-surface-400 flex items-center justify-between gap-2">
@@ -2007,9 +2074,8 @@ const saveModify = async () => {
                         <div class="text-xs font-semibold text-surface-500 uppercase tracking-wide mb-2 flex items-center gap-1">
                             <i class="pi pi-tag text-xs" /> Extras / Misceláneos
                         </div>
-                        <InputNumber v-model="editForm.gasto_misc" :min="0" :minFractionDigits="2" :maxFractionDigits="2"
-                            class="w-full" placeholder="Anillas, llaveros, embalaje..." />
-                        <small class="text-surface-400 mt-1 block">Importe directo añadido al precio final (sin markup)</small>
+                        <CampoNumero v-model="editForm.gasto_misc" :min-decimales="2" :max-decimales="2" :unidad="unit" />
+                        <small class="text-surface-400 mt-1 block">Anillas, llaveros, embalaje… Importe directo añadido al precio final (sin markup)</small>
                     </div>
 
                     <!-- Price comparison -->
@@ -2065,7 +2131,7 @@ const saveModify = async () => {
             <div class="text-sm text-surface-500">Pendiente: <strong>{{ fmt(linkDialog.pending) }}</strong></div>
             <div class="flex flex-col gap-1 min-w-0">
                 <label class="text-xs text-surface-500 uppercase tracking-wider font-semibold">Importe a cobrar</label>
-                <InputNumber v-model="linkDialog.amount" :min="0.01" :minFractionDigits="2" :maxFractionDigits="2" class="w-full" />
+                <CampoNumero v-model="linkDialog.amount" :min="0.01" :min-decimales="2" :max-decimales="2" :unidad="unit" />
                 <small class="text-surface-400">Puede ser mayor que el pendiente (incluye propina)</small>
             </div>
         </div>

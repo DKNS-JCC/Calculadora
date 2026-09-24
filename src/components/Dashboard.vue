@@ -81,6 +81,25 @@ const materialGastado = computed(() => {
     }
 })
 
+// Aviso: presupuestos auto-descartados en este arranque (15+ días sin respuesta)
+const autoDiscard = computed(() => store.autoDiscardNotice)
+const autoDiscardTotal = computed(() =>
+    (autoDiscard.value?.orders || []).reduce((s, o) => s + Number(o.precio_final || 0), 0)
+)
+const undoingDiscard = ref(false)
+
+const undoAutoDiscard = async () => {
+    undoingDiscard.value = true
+    try {
+        const n = await store.undoAutoDiscard()
+        toast.add({ severity: 'success', summary: 'Restaurados', detail: `${n} presupuesto${n === 1 ? '' : 's'} de vuelta en "Presupuesto enviado"`, life: 3200 })
+    } catch (e) {
+        toast.add({ severity: 'error', summary: 'Error', detail: e.message, life: 3500 })
+    } finally {
+        undoingDiscard.value = false
+    }
+}
+
 // Avisos: pedidos estancados (sin actualización en 7+ días)
 const { staleOrders, staleDays, snoozeStale, rejectStale, finishStale } = useStaleOrders()
 
@@ -151,6 +170,44 @@ const statusChartOptions = {
         <div class="flex items-center justify-between">
             <h1 class="text-2xl font-bold text-surface-900 dark:text-surface-0">Resumen de Negocio</h1>
             <div class="text-sm text-surface-500">{{ new Date().toLocaleDateString('es-ES', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' }) }}</div>
+        </div>
+
+        <!-- Aviso: presupuestos auto-descartados -->
+        <div v-if="autoDiscard?.orders?.length"
+             class="card rounded-2xl border-0 bg-slate-500/[0.07] dark:bg-slate-400/[0.07] ring-1 ring-slate-500/20 overflow-hidden">
+            <div class="p-4 flex flex-wrap items-start gap-3">
+                <div class="w-10 h-10 rounded-xl bg-slate-500/10 flex items-center justify-center shrink-0">
+                    <i class="pi pi-inbox text-slate-500" />
+                </div>
+                <div class="flex-1 min-w-[14rem]">
+                    <div class="font-bold text-sm text-surface-900 dark:text-surface-0">
+                        {{ autoDiscard.orders.length }} presupuesto{{ autoDiscard.orders.length === 1 ? '' : 's' }}
+                        movido{{ autoDiscard.orders.length === 1 ? '' : 's' }} a «Descartado»
+                    </div>
+                    <div class="text-xs text-surface-500 mt-0.5">
+                        Llevaban más de 15 días en «Presupuesto enviado» sin respuesta del cliente.
+                        Se han archivado y ya no cuentan como pendiente de cobro
+                        ({{ fmtMoney(autoDiscardTotal) }} que no eran reales). No se ha notificado a nadie.
+                    </div>
+                </div>
+                <div class="flex gap-1.5 ml-auto shrink-0">
+                    <Button label="Deshacer" size="small" severity="secondary" outlined
+                            :loading="undoingDiscard" @click="undoAutoDiscard"
+                            v-tooltip.bottom="'Devuelve estos pedidos a Presupuesto enviado'" />
+                    <Button label="Entendido" size="small" severity="secondary" text
+                            @click="store.dismissAutoDiscardNotice()" />
+                </div>
+            </div>
+            <div class="border-t border-black/[0.05] dark:border-white/[0.05] divide-y divide-black/[0.04] dark:divide-white/[0.04]">
+                <div v-for="o in autoDiscard.orders" :key="o.id"
+                     class="px-4 py-2 flex items-center gap-3 text-xs">
+                    <span class="font-mono text-surface-400 shrink-0">#{{ o.id }}</span>
+                    <span class="font-semibold truncate">{{ o.cliente }}</span>
+                    <span class="text-surface-500 truncate flex-1">{{ o.descripcion }}</span>
+                    <span class="text-surface-400 shrink-0">{{ o.dias }} días</span>
+                    <span class="font-bold text-surface-500 shrink-0 w-20 text-right">{{ fmtMoney(o.precio_final) }}</span>
+                </div>
+            </div>
         </div>
 
         <!-- KPI Grid -->

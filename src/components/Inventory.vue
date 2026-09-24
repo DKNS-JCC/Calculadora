@@ -7,7 +7,7 @@ import DataTable from 'primevue/datatable'
 import Column from 'primevue/column'
 import Button from 'primevue/button'
 import Dialog from 'primevue/dialog'
-import InputNumber from 'primevue/inputnumber'
+import CampoNumero from './CampoNumero.vue'
 import InputText from 'primevue/inputtext'
 import Select from 'primevue/select'
 import ColorPicker from 'primevue/colorpicker'
@@ -290,7 +290,7 @@ const deleteItem = (item) => {
                     <small class="text-surface-400 mb-2">Se calcula solo sumando los pedidos aceptados, incluidos los archivados.</small>
 
                     <label for="inv-ajuste" class="text-sm text-surface-400">Ajuste manual</label>
-                    <InputNumber id="inv-ajuste" v-model="editingItem.ajuste_g" :min="0" suffix=" g" class="w-full" />
+                    <CampoNumero input-id="inv-ajuste" v-model="editingItem.ajuste_g" :max-decimales="2" unidad="g" />
                     <small class="text-surface-400">Gramos que no salen de ningún pedido: purgas, fallos, bobina estropeada.</small>
                 </div>
             </div>
