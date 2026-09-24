@@ -22,6 +22,7 @@ const emailModel = computed({
 })
 
 const STATUS_BADGE = {
+    'Nuevo': { sev: 'contrast', icon: 'pi-inbox', color: '#ec4899' },
     'Presupuesto enviado': { sev: 'info', icon: 'pi-send', color: '#3b82f6' },
     'Aceptado': { sev: 'success', icon: 'pi-check-circle', color: '#10b981' },
     'En producción': { sev: 'warn', icon: 'pi-cog', color: '#f59e0b' },
@@ -61,7 +62,7 @@ const close = () => emit('update:visible', false)
                 <div class="flex-1 min-w-0">
                     <div class="font-bold text-surface-900 dark:text-surface-0 text-base">{{ headerTitle }}</div>
                     <div class="text-xs text-surface-500 dark:text-surface-300 mt-0.5">
-                        Vamos a notificar al cliente del cambio de estado y adjuntaremos el PDF del presupuesto.
+                        Vamos a notificar al cliente del cambio de estado, con el enlace para seguir su pedido.
                     </div>
                 </div>
             </div>
@@ -102,7 +103,7 @@ const close = () => emit('update:visible', false)
                 <small v-else-if="!emailValid" class="text-amber-500">Falta el email del cliente</small>
                 <small v-else class="text-surface-400 flex items-center gap-1">
                     <i class="pi pi-paperclip text-[10px]" />
-                    Se adjuntará el PDF del presupuesto cliente
+                    {{ newStatus === 'Presupuesto enviado' ? 'Se adjuntará el PDF del presupuesto (en el escritorio)' : 'Mismo correo y plantilla que la web' }}
                 </small>
             </div>
         </div>

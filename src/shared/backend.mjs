@@ -182,7 +182,19 @@ export const URGENCIA = {
   Urgente: 0.5,
 }
 
+/**
+ * Ciclo de vida del pedido. Es el vocabulario común con la web: la tabla
+ * pedido_estados de Supabase (migración 0026 del proyecto web) tiene estas
+ * mismas etiquetas, en este orden, y su equivalencia en la web. Si cambias
+ * esta lista, cambia también esa tabla.
+ *
+ * 'Nuevo' es una solicitud del tasador web que aún no tiene presupuesto
+ * enviado: la crea Supabase sola al recibirla.
+ */
+export const ORDER_NEW = 'Nuevo'
+
 export const ORDER_LIFECYCLE = [
+  ORDER_NEW,
   'Presupuesto enviado',
   'Aceptado',
   'En producción',
@@ -269,10 +281,10 @@ export function isStaleQuote(o, now = Date.now()) {
 
 /**
  * Estados con compromiso económico: el cliente ya dijo que sí. Los únicos
- * que suman en facturación. 'Presupuesto enviado' es una oferta abierta y
- * 'Descartado' un lead frío: ninguno de los dos es dinero.
+ * que suman en facturación. 'Nuevo' y 'Presupuesto enviado' son ofertas
+ * abiertas y 'Descartado' un lead frío: ninguno de ellos es dinero.
  */
-export const ORDER_COMMITTED = ORDER_LIFECYCLE.slice(1)
+export const ORDER_COMMITTED = ORDER_LIFECYCLE.slice(ORDER_LIFECYCLE.indexOf('Aceptado'))
 
 export function isCommitted(o) {
   return ORDER_COMMITTED.includes(normalizeEstado(o?.estado))
@@ -525,6 +537,8 @@ function normalizeOrder(input) {
           amount: roundMoney(p?.amount || 0),
           note: String(p?.note || ''),
           source: String(p?.source || 'manual'),
+          // Apunte del libro de cobros común con la web (lo pone el servidor).
+          ...(p?.cobro_id ? { cobro_id: String(p.cobro_id) } : {}),
         }))
       : [],
   }

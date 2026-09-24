@@ -405,6 +405,7 @@ const ESTADO_COLORS = {
     'En producción': '#60a5fa',
     'Aceptado': '#fbbf24',
     'Presupuesto enviado': '#fb923c',
+    'Nuevo': '#f472b6',
     [ORDER_DISCARDED]: '#94a3b8',
 }
 const chartEstados = computed(() => {

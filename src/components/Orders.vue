@@ -1,6 +1,7 @@
 <script setup>
 import { computed, reactive, ref, watch } from 'vue'
 import { store } from '../store'
+import * as fsService from '../supabaseService'
 import { api } from '../platform'
 import DataTable from 'primevue/datatable'
 import Column from 'primevue/column'
@@ -99,7 +100,9 @@ const compactMode = ref(localStorage.getItem('orders_compact') === 'true')
 const pendingDelete = reactive({ order: null, timer: null })
 
 const PAYMENT_METHODS = ['Efectivo', 'Bizum', 'Transferencia', 'Stripe', 'Otro']
+// Mismo orden que pedido_estados en Supabase (vocabulario común con la web).
 const ORDER_STATUS = [
+    'Nuevo',
     'Presupuesto enviado',
     'Aceptado',
     'En producción',
@@ -121,7 +124,7 @@ const beneficioReal = computed(() => {
 const total = computed(() => orders.value.length)
 const archivedCount = computed(() => orders.value.filter(o => o.archived).length)
 const activosCount = computed(() => orders.value.filter(o => !o.archived).length)
-const pendientesCount = computed(() => orders.value.filter(o => !o.archived && ['Presupuesto enviado', 'Enviado'].includes(o.estado)).length)
+const pendientesCount = computed(() => orders.value.filter(o => !o.archived && ['Nuevo', 'Presupuesto enviado', 'Enviado'].includes(o.estado)).length)
 const descartadosCount = computed(() => orders.value.filter(o => o.estado === 'Descartado').length)
 const enProduccionCount = computed(() => orders.value.filter(o => !o.archived && ['Aceptado', 'En producción', 'Post-procesado', 'Listo para entregar'].includes(o.estado)).length)
 
@@ -433,6 +436,7 @@ const paymentSeverity = (status) => {
 
 const getSeverity = (status) => {
     const map = {
+        'Nuevo': 'contrast',
         'Presupuesto enviado': 'info',
         'Enviado': 'info',
         'Aceptado': 'success',
@@ -460,8 +464,9 @@ const closeDetail = () => {
 }
 
 const _maybeAskEmailFor = async (order, newStatus, title) => {
-    const emailEnabled = !!store.appData.global_config?.email_enabled
-    if (!emailEnabled || !order?.cliente_email || order.estado === newStatus) return { proceed: true, options: {} }
+    const emailEnabled = store.puedeAvisar(order)
+    // Descartar nunca avisa (limpieza interna), así que no se pregunta.
+    if (!emailEnabled || !order?.cliente_email || order.estado === newStatus || newStatus === 'Descartado') return { proceed: true, options: {} }
     const choice = await askEmailConfirm({
         order: { ...order, estado: newStatus },
         oldStatus: order.estado,
@@ -526,8 +531,8 @@ const quickChangeStatus = async (order, newStatus) => {
             }
         }, decision.options)
 
-        const emailEnabled = !!store.appData.global_config?.email_enabled
-        const willEmail = emailEnabled && !!order.cliente_email && !decision.options.skipNotification
+        const emailEnabled = store.puedeAvisar(order)
+        const willEmail = emailEnabled && !!order.cliente_email && !decision.options.skipNotification && newStatus !== 'Descartado'
         
         if (shouldAutoArchive) {
             toast.add({ severity: 'success', summary: 'Pedido archivado', detail: 'Totalmente pagado automáticamente', life: 3500 })
@@ -663,11 +668,45 @@ const removeImage = () => {
     imageDataUrl.value = ''
 }
 
+/* Justificante PDF de un cobro: el mismo que emite la web (recibo-emitir). */
+const emitiendo = ref(null)
+const emitirJustificante = (payment) => {
+    const order = selectedOrder.value
+    if (!payment?.cobro_id || !order) return
+    confirmDlg.require({
+        message: order.cliente_email
+            ? `Se archivará el justificante de ${fmt(payment.amount)} y se enviará a ${order.cliente_email}. Una vez emitido solo se puede anular.`
+            : `Se archivará el justificante de ${fmt(payment.amount)} (el pedido no tiene email: descárgalo desde la web). Una vez emitido solo se puede anular.`,
+        header: 'Emitir justificante',
+        icon: 'pi pi-file-pdf',
+        rejectLabel: 'Cancelar',
+        acceptLabel: 'Emitir',
+        accept: async () => {
+            emitiendo.value = payment.cobro_id
+            try {
+                const res = await fsService.emitirJustificante(payment.cobro_id, { enviarEmail: !!order.cliente_email })
+                if (!res.ok) throw new Error(res.error)
+                toast.add({
+                    severity: res.aviso ? 'warn' : 'success',
+                    summary: `Justificante ${res.codigo}`,
+                    detail: res.aviso || (res.enviado ? `Enviado a ${order.cliente_email}` : 'Archivado'),
+                    life: 5000,
+                })
+                if (res.url) api.openUrl(res.url)
+            } catch (e) {
+                toast.add({ severity: 'error', summary: 'No se pudo emitir', detail: e.message, life: 5000 })
+            } finally {
+                emitiendo.value = null
+            }
+        },
+    })
+}
+
 const removePaymentRecord = async (payment) => {
     const orderId = selectedOrder.value?.id
     if (!orderId || !payment?.id) return
     confirmDlg.require({
-        message: '¿Eliminar este movimiento de cobro?',
+        message: '¿Anular este cobro? Deja de contar aquí y en la web; queda registrado como anulado.',
         header: 'Confirmar',
         icon: 'pi pi-exclamation-triangle',
         rejectLabel: 'Cancelar',
@@ -684,7 +723,7 @@ const removePaymentRecord = async (payment) => {
                     syncSelection(orderId)
                     toast.add({ severity: 'warn', summary: 'Pedido recuperado', detail: 'Pago incompleto — el pedido se ha desarchivado', life: 3000 })
                 } else {
-                    toast.add({ severity: 'success', summary: 'Movimiento eliminado', detail: 'El pedido se recalculó automáticamente', life: 2600 })
+                    toast.add({ severity: 'success', summary: 'Cobro anulado', detail: 'El pedido se recalculó automáticamente', life: 2600 })
                 }
             } catch (e) {
                 toast.add({ severity: 'error', summary: 'Error', detail: e.message, life: 3500 })
@@ -755,7 +794,7 @@ const saveOrderEdits = async () => {
     try {
         const oldStatus = selectedOrder.value.estado
         const statusChanged = oldStatus !== detail.estado
-        const emailEnabled = !!store.appData.global_config?.email_enabled
+        const emailEnabled = store.puedeAvisar(selectedOrder.value) && detail.estado !== 'Descartado'
 
         // Ask for confirmation if status changed and we'd send an email
         let storeOptions = {}
@@ -1525,7 +1564,7 @@ const saveModify = async () => {
                                 <span class="text-surface-400 normal-case font-normal">— opcional, para recibir notificaciones</span>
                             </label>
                             <InputText v-model="detail.cliente_email" type="email" placeholder="cliente@ejemplo.com" class="w-full" size="small" :disabled="isPartnerOrder" />
-                            <small v-if="detail.cliente_email && !store.appData.global_config?.email_enabled" class="text-amber-500">
+                            <small v-if="detail.cliente_email && !store.puedeAvisar(selectedOrder)" class="text-amber-500">
                                 <i class="pi pi-exclamation-triangle text-[10px] mr-1" />Las notificaciones por email están desactivadas en Configuración.
                             </small>
                             <small v-else-if="detail.cliente_email" class="text-surface-400">
@@ -1735,8 +1774,12 @@ const saveModify = async () => {
                                     <div v-if="ev.ts" class="text-[10px] text-surface-400">{{ fmtDate(ev.ts) }}</div>
                                     <div v-if="ev.note" class="text-[10px] text-surface-400 truncate" :title="ev.note">{{ ev.note }}</div>
                                 </div>
+                                <Button v-if="ev.payment?.cobro_id && Number(ev.payment.amount) > 0 && store.empresa === '3DCC' && !isPartnerOrder"
+                                    icon="pi pi-file-pdf" severity="secondary" text size="small" rounded class="!w-6 !h-6 shrink-0"
+                                    :loading="emitiendo === ev.payment.cobro_id"
+                                    @click="emitirJustificante(ev.payment)" v-tooltip.left="'Emitir justificante PDF'" />
                                 <Button v-if="ev.payment" icon="pi pi-times" severity="danger" text size="small" rounded class="!w-6 !h-6 shrink-0"
-                                    @click="removePaymentRecord(ev.payment)" :disabled="isPartnerOrder" v-tooltip.left="'Eliminar cobro'" />
+                                    @click="removePaymentRecord(ev.payment)" :disabled="isPartnerOrder" v-tooltip.left="'Anular cobro'" />
                             </div>
                         </div>
                     </div>
@@ -1748,7 +1791,7 @@ const saveModify = async () => {
                             <span class="text-surface-400">{{ selectedOrder.notif_history?.length || 0 }}</span>
                         </div>
                         <div v-if="!selectedOrder.notif_history?.length" class="px-3 py-3 text-xs text-surface-400 text-center">
-                            Aún no se ha enviado ningún email. Se mandará automáticamente al cambiar de estado.
+                            Aún no se ha enviado ningún email. Al cambiar de estado se te preguntará si avisar al cliente.
                         </div>
                         <div v-else class="max-h-32 overflow-auto divide-y divide-black/[0.04] dark:divide-white/[0.06]">
                             <div v-for="(n, i) in selectedOrder.notif_history" :key="i" class="px-3 py-2 text-xs">

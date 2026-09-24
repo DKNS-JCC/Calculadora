@@ -233,7 +233,7 @@ async function onLoginSuccess({ uid, email, empresa }) {
                 <Tab value="2">
                     <i class="pi pi-list mr-2" />Pedidos
                     <span v-if="pendingOrdersCount" class="ml-1.5 px-1.5 py-0.5 rounded-full text-[10px] font-bold bg-amber-500 text-white leading-none">{{ pendingOrdersCount }}</span>
-                    <span v-if="store.webQuotesCount && !store.ghostMode" class="ml-1 px-1.5 py-0.5 rounded-full text-[10px] font-bold bg-sky-500 text-white leading-none" v-tooltip.bottom="'Presupuestos web sin pedido'">{{ store.webQuotesCount }}</span>
+                    <span v-if="store.webQuotesCount && !store.ghostMode" class="ml-1 px-1.5 py-0.5 rounded-full text-[10px] font-bold bg-sky-500 text-white leading-none" v-tooltip.bottom="'Solicitudes web por presupuestar'">{{ store.webQuotesCount }}</span>
                 </Tab>
                 <Tab value="3">
                     <i class="pi pi-box mr-2" />Inventario
