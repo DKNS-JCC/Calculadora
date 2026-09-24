@@ -28,6 +28,7 @@ const STATUS_BADGE = {
     'Post-procesado': { sev: 'help', icon: 'pi-sparkles', color: '#8b5cf6' },
     'Listo para entregar': { sev: 'info', icon: 'pi-box', color: '#0ea5e9' },
     'Entregado': { sev: 'success', icon: 'pi-check', color: '#059669' },
+    'Descartado': { sev: 'secondary', icon: 'pi-inbox', color: '#64748b' },
 }
 const newBadge = computed(() => STATUS_BADGE[props.newStatus] || { sev: 'secondary', icon: 'pi-circle', color: '#6b7280' })
 const oldBadge = computed(() => STATUS_BADGE[props.oldStatus] || { sev: 'secondary', icon: 'pi-circle', color: '#9ca3af' })

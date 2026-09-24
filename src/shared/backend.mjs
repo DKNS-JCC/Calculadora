@@ -10,10 +10,21 @@
  * aplica automáticamente a PC y móvil.
  */
 
+import { formatHoras } from './formatos.mjs'
+
+// Fecha local en YYYY-MM-DD: toISOString() da la de UTC (de 00:00 a 02:00 en España, el día anterior)
+const hoyLocalISO = () => {
+  const d = new Date()
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+}
+
 /* ── Lookup tables ─────────────────────────────────────────────────────── */
 
 /* Tarifas de mano de obra ─ expresadas en MINUTOS y valoradas a
- * global_config.labor_cost_h. A 15 €/h resultan los importes del tarifario:
+ * su coste/hora. Son dos costes distintos, porque diseñar y lijar no valen lo
+ * mismo por hora y, colgando del mismo número, no se podía subir uno sin subir
+ * el otro: DISEÑO usa global_config.labor_cost_h y POST-PROCESADO usa
+ * global_config.postproc_cost_h. Con ambos a 15 €/h sale el tarifario base:
  *
  *   DISEÑO           No necesario 0,00 · Básica 2,25 · Búsqueda 3,75
  *                    Media 7,50 · Alta 15,00 · A medida = horas × coste/h
@@ -114,19 +125,29 @@ export function migratePostprocesado(postprocLabel, soportesLabel) {
  * valorado al coste/hora vigente. Única fuente de verdad para la interfaz:
  * si cambia la tabla de tarifas, los desplegables cambian solos.
  */
+export function disenoCostH(gconfig) {
+  return Math.max(0, Number(gconfig?.labor_cost_h) || 0)
+}
+
+/** Coste/hora del post-procesado. Si no está fijado, hereda el de diseño,
+ *  de modo que una instalación anterior a los dos costes no cambia de precio. */
+export function postprocCostH(gconfig) {
+  const propio = Number(gconfig?.postproc_cost_h)
+  return Number.isFinite(propio) && propio > 0 ? propio : disenoCostH(gconfig)
+}
+
 export function laborOptions(gconfig) {
-  const laborH = Number(gconfig?.labor_cost_h || 0)
-  const build = (table, descs) => Object.entries(table).map(([value, minutes]) => ({
+  const build = (table, descs, costeH) => Object.entries(table).map(([value, minutes]) => ({
     value,
     label: value,
     desc: descs[value] || '',
     minutes,
-    eur: (minutes / 60) * laborH,
+    eur: (minutes / 60) * costeH,
     custom: value === DISENO_A_MEDIDA,
   }))
   return {
-    diseno: build(DISENO_MODELADO, DISENO_MODELADO_DESC),
-    postproc: build(POSTPROCESADO, POSTPROCESADO_DESC),
+    diseno: build(DISENO_MODELADO, DISENO_MODELADO_DESC, disenoCostH(gconfig)),
+    postproc: build(POSTPROCESADO, POSTPROCESADO_DESC, postprocCostH(gconfig)),
   }
 }
 
@@ -170,11 +191,143 @@ export const ORDER_LIFECYCLE = [
   'Entregado',
 ]
 
+/**
+ * Estado terminal fuera del ciclo de vida: el presupuesto se envió y el
+ * cliente nunca respondió. No es un fracaso de producción, es un lead frío.
+ * Se separa de ORDER_LIFECYCLE para que no aparezca como "siguiente paso"
+ * ni cuente en las métricas de producción.
+ */
+export const ORDER_DISCARDED = 'Descartado'
+
+/** Todos los estados seleccionables a mano en la UI. */
+export const ORDER_STATUS_ALL = [...ORDER_LIFECYCLE, ORDER_DISCARDED]
+
+/**
+ * Días que un presupuesto puede quedarse en 'Presupuesto enviado' sin
+ * respuesta antes de auto-descartarse.
+ */
+export const AUTO_DISCARD_DAYS = 15
+
 export function normalizeEstado(value) {
   const v = String(value || '').trim()
   if (!v) return 'Presupuesto enviado'
   if (v === 'Enviado') return 'Presupuesto enviado'
+  if (v === 'Rechazado' || v === 'descartado') return ORDER_DISCARDED
   return v
+}
+
+/**
+ * Timestamp del último movimiento del pedido, con degradación:
+ * last_status_update → created_at → fecha (YYYY-MM-DD o DD/MM/YYYY).
+ * Devuelve 0 si no hay ninguna fecha utilizable.
+ */
+export function lastUpdateTs(o) {
+  for (const c of [o?.last_status_update, o?.created_at]) {
+    if (!c) continue
+    const t = new Date(c).getTime()
+    if (!Number.isNaN(t)) return t
+  }
+  const f = String(o?.fecha || '')
+  if (/^\d{4}-\d{2}-\d{2}$/.test(f)) return new Date(f + 'T00:00:00').getTime()
+  const p = f.split('/')
+  if (p.length === 3) {
+    const t = new Date(Number(p[2]), Number(p[1]) - 1, Number(p[0])).getTime()
+    if (!Number.isNaN(t)) return t
+  }
+  return 0
+}
+
+/**
+ * ¿Es un presupuesto muerto? Lleva más de AUTO_DISCARD_DAYS en el estado
+ * inicial sin respuesta del cliente.
+ *
+ * Se excluyen a propósito:
+ *  - pedidos archivados o de la empresa socia (no son nuestros)
+ *  - cualquier estado posterior a 'Presupuesto enviado' (ya hay compromiso)
+ *  - los que tienen algún importe pagado (hubo adelanto: está vivo)
+ */
+export function isStaleQuote(o, now = Date.now()) {
+  if (!o || o.archived || o._fromPartner) return false
+  if (normalizeEstado(o.estado) !== 'Presupuesto enviado') return false
+  if (Number(o.importe_pagado || 0) > 0) return false
+  const ts = lastUpdateTs(o)
+  return ts > 0 && (now - ts) > AUTO_DISCARD_DAYS * 86400000
+}
+
+/* ── Dinero real ────────────────────────────────────────────────────────
+   Tres cosas que la app ya guarda pero que las métricas venían ignorando:
+
+   1. `payment_history` es el libro de caja: cada cobro con su fecha y su
+      método. `importe_pagado` sólo dice el acumulado y `payment_method`
+      guarda el método del ÚLTIMO cobro, así que un pedido cobrado mitad en
+      efectivo y mitad por Bizum figuraba entero como Bizum.
+   2. `repeticiones_error` son reimpresiones que se pagaron de verdad: el
+      coste real es el bruto tantas veces como hubo que repetir.
+   3. `gasto_misc` es un desembolso que se repercute al cliente a precio de
+      coste; `beneficio_neto` no lo descuenta y por eso infla el margen.
+   ──────────────────────────────────────────────────────────────────────── */
+
+/**
+ * Estados con compromiso económico: el cliente ya dijo que sí. Los únicos
+ * que suman en facturación. 'Presupuesto enviado' es una oferta abierta y
+ * 'Descartado' un lead frío: ninguno de los dos es dinero.
+ */
+export const ORDER_COMMITTED = ORDER_LIFECYCLE.slice(1)
+
+export function isCommitted(o) {
+  return ORDER_COMMITTED.includes(normalizeEstado(o?.estado))
+}
+
+function round2(value) {
+  return Math.round(Number(value || 0) * 100) / 100
+}
+
+/**
+ * Movimientos de caja de un pedido, con la fecha en la que entró el dinero
+ * (no la del pedido). Descarta los apuntes de `recalculation`, que registran
+ * cambios de precio con importe 0 y no son cobros.
+ *
+ * Si el historial no llega a `importe_pagado` —pedidos anteriores al libro
+ * de caja— el resto se imputa a la fecha del pedido para no perder caja.
+ *
+ * @returns {{ts:number, amount:number, method:string}[]}
+ */
+export function orderCashEvents(o) {
+  const events = []
+  for (const p of Array.isArray(o?.payment_history) ? o.payment_history : []) {
+    const amount = Number(p?.amount || 0)
+    if (!amount) continue
+    const ts = new Date(p?.created_at).getTime()
+    events.push({
+      ts: Number.isNaN(ts) ? lastUpdateTs(o) : ts,
+      amount,
+      method: String(p?.method || '').trim() || 'Sin registrar',
+    })
+  }
+  const registrado = events.reduce((s, e) => s + e.amount, 0)
+  const resto = round2(Number(o?.importe_pagado || 0) - registrado)
+  if (resto > 0.009) {
+    events.push({
+      ts: lastUpdateTs(o),
+      amount: resto,
+      method: String(o?.payment_method || '').trim() || 'Sin registrar',
+    })
+  }
+  return events
+}
+
+/**
+ * Lo que el pedido costó de verdad: material + luz + desgaste por cada
+ * pasada que hubo que imprimir, más los extras pagados de bolsillo.
+ */
+export function orderRealCost(o) {
+  const reps = Math.max(0, Math.floor(Number(o?.repeticiones_error) || 0))
+  return round2(Number(o?.coste_bruto || 0) * (1 + reps) + Number(o?.gasto_misc || 0))
+}
+
+/** Precio cobrado menos coste real. Puede ser negativo: un pedido puede salir mal. */
+export function orderRealProfit(o) {
+  return round2(Number(o?.precio_final || 0) - orderRealCost(o))
 }
 
 /* ── Helpers ───────────────────────────────────────────────────────────── */
@@ -226,6 +379,7 @@ export function createDefaultData() {
     global_config: {
       energy_cost_kwh: 0.24,
       labor_cost_h: 15,
+      postproc_cost_h: 15,
       money_unit: '€',
       precio_minimo: 3,
       stripe_secret_key: '',
@@ -401,7 +555,15 @@ export function normalizeData(raw) {
   if (!Array.isArray(data.orders)) data.orders = []
   data.orders = data.orders.map((order) => normalizeOrder(order))
 
+  // Ojo con el orden: el spread mete el postproc_cost_h por defecto (15) aunque
+  // la instalación tuviera otro coste/hora, lo que le cambiaría los precios sin
+  // avisar. Si el campo no existía, hereda el coste de diseño ya guardado.
+  const teniaPostprocCostH = Object.prototype.hasOwnProperty.call(data.global_config || {}, 'postproc_cost_h')
+  const laborGuardado = Number(data.global_config?.labor_cost_h)
   data.global_config = { ...defaults.global_config, ...(data.global_config || {}) }
+  if (!teniaPostprocCostH && Number.isFinite(laborGuardado) && laborGuardado > 0) {
+    data.global_config.postproc_cost_h = laborGuardado
+  }
   data.calc_state = { ...defaults.calc_state, ...(data.calc_state || {}) }
 
   if (!data.purge_config || typeof data.purge_config !== 'object') data.purge_config = { colors: [], values: [], active_by_printer: {} }
@@ -440,7 +602,8 @@ function getDepreciationPerHour(printer) {
 }
 
 function calculateCost({ peso_g, horas, filament_price_per_kg, printer, gconfig, diseno_str, diseno_horas, postproc_str, cantidad }) {
-  const laborH = Number(gconfig.labor_cost_h || 0)
+  const costeDiseno = disenoCostH(gconfig)
+  const costePostproc = postprocCostH(gconfig)
   const unidades = Math.max(1, Math.floor(Number(cantidad) || 1))
 
   const filamento = (peso_g * filament_price_per_kg) / 1000
@@ -451,10 +614,10 @@ function calculateCost({ peso_g, horas, filament_price_per_kg, printer, gconfig,
   const disenoMin = diseno_str === DISENO_A_MEDIDA
     ? Math.max(0, Number(diseno_horas) || 0) * 60
     : (DISENO_MODELADO[diseno_str] || 0)
-  const diseno = (disenoMin / 60) * laborH
+  const diseno = (disenoMin / 60) * costeDiseno
 
   // Post-procesado: trabajo manual pieza a pieza, escala con la cantidad.
-  const postproc = ((POSTPROCESADO[postproc_str] || 0) / 60) * laborH * unidades
+  const postproc = ((POSTPROCESADO[postproc_str] || 0) / 60) * costePostproc * unidades
 
   return {
     filamento: round4(filamento),
@@ -991,7 +1154,7 @@ export function duplicateOrder(data, orderId) {
   const newOrder = normalizeOrder({
     ...order,
     id: undefined,
-    fecha: new Date().toISOString().slice(0, 10),
+    fecha: hoyLocalISO(),
     estado: 'Presupuesto enviado',
     importe_pagado: 0,
     payment_history: [],
@@ -1094,7 +1257,7 @@ export function getTickets(resultInfo) {
     '  [ DETALLES TÉCNICOS ]',
     `  • Material:   ${info.filamento} (${info.filamento_color || '-'})`,
     `  • Peso est.:  ${info.peso} g`,
-    `  • Tiempo req: ${info.horas} h`,
+    `  • Tiempo req: ${formatHoras(info.horas)}`,
     `  • Urgencia:   ${info.urgencia_nivel}`,
     '',
     '  [ PRESUPUESTO ]',

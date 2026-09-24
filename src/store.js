@@ -2,6 +2,7 @@ import { reactive } from 'vue'
 import { onAuthChange, getUserEmpresa, logout as firebaseLogout } from './supabase'
 import * as fsService from './supabaseService'
 import { api } from './platform'
+import { isStaleQuote, lastUpdateTs, ORDER_DISCARDED } from './shared/backend.mjs'
 
 export const store = reactive({
   /* ── Auth state ─────────────────────────────────────────────────────────── */
@@ -25,6 +26,11 @@ export const store = reactive({
   ghostMode: false,
   _ownAppData: null,
   _ownEmpresa: null,
+
+  /* ── Auto-descarte de presupuestos sin respuesta ────────────────────────── */
+  // Resultado del último barrido, para el aviso del Dashboard.
+  // { at: ISO, orders: [{ id, cliente, descripcion, precio_final, dias }] }
+  autoDiscardNotice: null,
 
   get isAuthenticated() {
     return !!this.user && !!this.empresa
@@ -96,6 +102,95 @@ export const store = reactive({
     this.isLoaded = true
 
     await this._migrateOrdersIfNeeded()
+    await this._autoDiscardStaleQuotes()
+  },
+
+  /**
+   * Barrido de presupuestos muertos.
+   *
+   * Un pedido que lleva AUTO_DISCARD_DAYS (15) en 'Presupuesto enviado' sin
+   * que el cliente conteste ni pague adelanto pasa a 'Descartado' y se
+   * archiva. Deja de contaminar el pendiente de cobro y las métricas.
+   *
+   * Se escribe igual que _migrateOrdersIfNeeded (fsService.saveOrder directo,
+   * sin pasar por updateOrder) a propósito: así NO se dispara ningún email de
+   * cambio de estado. Descartar es una limpieza interna — el cliente que no
+   * contestó no debe recibir un correo diciéndoselo.
+   *
+   * El resultado queda en store.autoDiscardNotice para que el Dashboard avise.
+   */
+  async _autoDiscardStaleQuotes() {
+    if (this.ghostMode) return
+    const now = Date.now()
+    const hoy = new Date().toLocaleDateString('es-ES')
+    const discarded = []
+
+    for (const order of this.appData.orders) {
+      if (!isStaleQuote(order, now)) continue
+
+      const dias = Math.floor((now - lastUpdateTs(order)) / 86400000)
+      order.estado = ORDER_DISCARDED
+      order.archived = true
+      order.last_status_update = new Date().toISOString()
+      order.auto_discarded_at = new Date().toISOString()
+      order.notes = (order.notes ? order.notes + '\n' : '') +
+        `[AUTO-DESCARTADO el ${hoy} · ${dias} días sin respuesta]`
+
+      discarded.push({
+        id: order.id,
+        cliente: order.cliente || '(sin nombre)',
+        descripcion: order.descripcion || '',
+        precio_final: Number(order.precio_final || 0),
+        dias,
+      })
+    }
+
+    if (!discarded.length) return
+
+    try {
+      await Promise.all(
+        discarded.map(d => fsService.saveOrder(this.empresa, this.appData.orders.find(o => o.id === d.id)))
+      )
+    } catch (e) {
+      console.error('[auto-discard] no se pudo persistir:', e)
+      return
+    }
+
+    this.autoDiscardNotice = { at: new Date().toISOString(), orders: discarded }
+  },
+
+  /** Cierra el aviso del Dashboard (no revierte nada). */
+  dismissAutoDiscardNotice() {
+    this.autoDiscardNotice = null
+  },
+
+  /**
+   * Deshace el último barrido: devuelve los pedidos a 'Presupuesto enviado' y
+   * los desarchiva. Al refrescar last_status_update el contador de 15 días
+   * vuelve a empezar, así que no reaparecen en el siguiente arranque.
+   */
+  async undoAutoDiscard() {
+    const notice = this.autoDiscardNotice
+    if (!notice?.orders?.length) return
+    const restored = []
+
+    for (const { id } of notice.orders) {
+      const order = this.appData.orders.find(o => o.id === id)
+      if (!order) continue
+      order.estado = 'Presupuesto enviado'
+      order.archived = false
+      order.last_status_update = new Date().toISOString()
+      order.auto_discarded_at = ''
+      order.notes = String(order.notes || '')
+        .split('\n')
+        .filter(l => !l.startsWith('[AUTO-DESCARTADO'))
+        .join('\n')
+      restored.push(order)
+    }
+
+    await Promise.all(restored.map(o => fsService.saveOrder(this.empresa, o)))
+    this.autoDiscardNotice = null
+    return restored.length
   },
 
   async _migrateOrdersIfNeeded() {
@@ -250,6 +345,9 @@ export const store = reactive({
     const email = String(order.cliente_email || '').trim()
     if (!email) return null
     if (oldStatus === newStatus) return null
+    // Descartar es limpieza interna: al cliente que no contestó no se le
+    // notifica que hemos dado su presupuesto por muerto.
+    if (newStatus === ORDER_DISCARDED) return null
 
     // Pedidos enlazados a una solicitud web: avisar vía la edge function
     // notify-quote (plantillas de la web + enlace de estado; funciona
@@ -319,6 +417,34 @@ export const store = reactive({
     this.appData.orders = [...newOrders, ...partnerOrders]
   },
 
+  /**
+   * Guarda un pedido y comprueba que el guardado llega a Supabase.
+   *
+   * El orden importa: la api muta la caché en memoria y la interfaz se
+   * repinta antes de esta llamada, así que si el guardado falla la pantalla
+   * se queda enseñando un cambio que no existe en el servidor —parece
+   * aplicado hasta que reinicias, y en el otro dispositivo no aparece—.
+   * Al fallar se recarga desde el servidor para que lo que se ve sea lo que
+   * hay de verdad, y se propaga el error para que la vista lo cante.
+   */
+  async _persistOrder(order) {
+    try {
+      await fsService.saveOrder(this._getOrderEmpresaToSave(order), order)
+    } catch (e) {
+      try { await this.loadApp() } catch { /* la recarga es best-effort */ }
+      const err = new Error(`No se pudo guardar en el servidor: ${e.message}`)
+      err.cause = e
+      throw err
+    }
+  },
+
+  /** Relee todo desde Supabase. Sin esto, cada dispositivo se queda con la
+   *  foto que cargó al abrir y no ve lo que hizo el otro. */
+  async refresh() {
+    if (this.ghostMode) return
+    await this.loadApp()
+  },
+
   _getOrderEmpresaToSave(order) {
     if (order && order._fromPartner && order._empresaOwner) {
       return order._empresaOwner
@@ -330,7 +456,7 @@ export const store = reactive({
     if (this.ghostMode) return
     const res = await api.saveOrderFromResult(JSON.parse(JSON.stringify(resultInfo)))
     this._applyOrdersUpdate(res.data.orders)
-    await fsService.saveOrder(this._getOrderEmpresaToSave(res.order), res.order)
+    await this._persistOrder(res.order)
 
     // Enlazar con el presupuesto web pendiente (bandeja fase 2)
     if (this.pendingWebQuote?.id && typeof fsService.linkOrderToQuote === 'function') {
@@ -380,7 +506,7 @@ export const store = reactive({
     const oldStatus = order?.estado || ''
     const res = await api.setOrderSent(orderId)
     this._applyOrdersUpdate(res.data.orders)
-    await fsService.saveOrder(this._getOrderEmpresaToSave(res.order), res.order)
+    await this._persistOrder(res.order)
     if (!options.skipNotification) {
       this._notifyStatusChange(res.order, oldStatus, res.order.estado, options).catch(() => {})
     }
@@ -402,7 +528,7 @@ export const store = reactive({
     const oldStatus = prev?.estado || ''
     const res = await api.updateOrder(structuredClone(params))
     this._applyOrdersUpdate(res.data.orders)
-    await fsService.saveOrder(this._getOrderEmpresaToSave(res.order), res.order)
+    await this._persistOrder(res.order)
     
     // CRM: Ensure client exists or email is updated
 
@@ -416,7 +542,7 @@ export const store = reactive({
     if (this.ghostMode) return
     const res = await api.recalculateOrder(structuredClone(params))
     this._applyOrdersUpdate(res.data.orders)
-    await fsService.saveOrder(this._getOrderEmpresaToSave(res.order), res.order)
+    await this._persistOrder(res.order)
     return res
   },
 
@@ -424,7 +550,7 @@ export const store = reactive({
     if (this.ghostMode) return
     const res = await api.addManualOrderPayment(structuredClone(params))
     this._applyOrdersUpdate(res.data.orders)
-    await fsService.saveOrder(this._getOrderEmpresaToSave(res.order), res.order)
+    await this._persistOrder(res.order)
     return res
   },
 
@@ -432,7 +558,7 @@ export const store = reactive({
     if (this.ghostMode) return
     const res = await api.removeOrderPaymentRecord(structuredClone(params))
     this._applyOrdersUpdate(res.data.orders)
-    await fsService.saveOrder(this._getOrderEmpresaToSave(res.order), res.order)
+    await this._persistOrder(res.order)
     return res
   },
 
@@ -440,7 +566,7 @@ export const store = reactive({
     if (this.ghostMode) return
     const res = await api.generateOrderPaymentLink(structuredClone(params))
     this._applyOrdersUpdate(res.data.orders)
-    await fsService.saveOrder(this._getOrderEmpresaToSave(res.order), res.order)
+    await this._persistOrder(res.order)
     return res
   },
 
@@ -448,7 +574,7 @@ export const store = reactive({
     if (this.ghostMode) return
     const res = await api.duplicateOrder(orderId)
     this._applyOrdersUpdate(res.data.orders)
-    await fsService.saveOrder(this._getOrderEmpresaToSave(res.order), res.order)
+    await this._persistOrder(res.order)
     return res
   },
 

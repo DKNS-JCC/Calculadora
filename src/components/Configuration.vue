@@ -12,14 +12,17 @@ import Column from 'primevue/column'
 import Button from 'primevue/button'
 import Toolbar from 'primevue/toolbar'
 import InputText from 'primevue/inputtext'
-import InputNumber from 'primevue/inputnumber'
+import CampoNumero from './CampoNumero.vue'
 import Dialog from 'primevue/dialog'
 import Message from 'primevue/message'
 import ToggleSwitch from 'primevue/toggleswitch'
 import Textarea from 'primevue/textarea'
 import { useToast } from 'primevue/usetoast'
-import { laborOptions } from '../shared/backend.mjs'
+import { laborOptions, disenoCostH, postprocCostH } from '../shared/backend.mjs'
+import { checkForUpdate, describeCheck, isAndroid as isAndroidApp } from '../utils/androidUpdater'
 import PurgeMatrix from './PurgeMatrix.vue'
+
+const emit = defineEmits(['install-update'])
 
 const config = computed(() => store.appData.global_config)
 const printers = computed(() => store.appData.printers)
@@ -28,14 +31,45 @@ const materials = computed(() => store.appData.filament_types)
 const saved = ref(false)
 const toast = useToast()
 
+/* ── Comprobación manual de actualizaciones ──────────────────────────────
+ * La del arranque se traga los errores para no molestar sin cobertura, con
+ * el efecto de que un canal roto se ve igual que "estás al día". Ésta dice
+ * exactamente lo que ha pasado. */
+const updateChecking = ref(false)
+const updateMessage = ref('')
+const updateSeverity = ref('info')
+const updateFound = ref(null)
+
+async function manualUpdateCheck() {
+    updateChecking.value = true
+    updateFound.value = null
+    try {
+        const result = await checkForUpdate({ force: true })
+        updateMessage.value = describeCheck(result)
+        updateSeverity.value = result.status === 'error' || result.status === 'no-asset'
+            ? 'error'
+            : result.status === 'available' ? 'warn' : 'success'
+        if (result.available) updateFound.value = result
+    } catch (e) {
+        updateMessage.value = `No se pudo comprobar: ${e.message}`
+        updateSeverity.value = 'error'
+    } finally {
+        updateChecking.value = false
+    }
+}
+
 /* Tarifario de mano de obra: se deriva del coste/hora, así que se muestra
  * aquí en vivo para ver qué importes produce el valor que se está editando. */
 const tarifaUnit = (v) => `${Number(v || 0).toFixed(2)} ${config.value?.money_unit || '€'}`
 const tarifario = computed(() => {
-    const opts = laborOptions({ labor_cost_h: Number(config.value?.labor_cost_h || 0) })
+    const gc = {
+        labor_cost_h: Number(config.value?.labor_cost_h || 0),
+        postproc_cost_h: Number(config.value?.postproc_cost_h || 0),
+    }
+    const opts = laborOptions(gc)
     return [
-        { titulo: 'Diseño', filas: opts.diseno, nota: 'Se cobra una vez por pedido.' },
-        { titulo: 'Post-procesado', filas: opts.postproc, nota: 'Incluye soportes. Se multiplica por cada pieza.' },
+        { titulo: 'Diseño', filas: opts.diseno, costeH: disenoCostH(gc), nota: 'Se cobra una vez por pedido.' },
+        { titulo: 'Post-procesado', filas: opts.postproc, costeH: postprocCostH(gc), nota: 'Incluye soportes. Se multiplica por cada pieza.' },
     ]
 })
 const emailTesting = ref(false)
@@ -289,11 +323,17 @@ const selectPdfFolder = async () => {
                     <div class="grid grid-cols-2 gap-4">
                         <div class="flex flex-col gap-1">
                             <label class="text-sm font-medium">Electricidad (€/kWh)</label>
-                            <InputNumber v-model="config.energy_cost_kwh" :minFractionDigits="2" :maxFractionDigits="4" class="w-full" />
+                            <CampoNumero v-model="config.energy_cost_kwh" :min-decimales="2" :max-decimales="4" />
                         </div>
                         <div class="flex flex-col gap-1">
-                            <label class="text-sm font-medium">Mano de Obra (€/h)</label>
-                            <InputNumber v-model="config.labor_cost_h" :minFractionDigits="2" class="w-full" />
+                            <label class="text-sm font-medium">Diseño (€/h)</label>
+                            <CampoNumero v-model="config.labor_cost_h" :min-decimales="2" :max-decimales="2" />
+                            <small class="text-surface-400">Modelado, slicer y búsqueda de modelos.</small>
+                        </div>
+                        <div class="flex flex-col gap-1">
+                            <label class="text-sm font-medium">Post-procesado (€/h)</label>
+                            <CampoNumero v-model="config.postproc_cost_h" :min-decimales="2" :max-decimales="2" />
+                            <small class="text-surface-400">Soportes, lijado, ensamblado y pintura.</small>
                         </div>
                         <div class="flex flex-col gap-1">
                             <label class="text-sm font-medium">Moneda</label>
@@ -301,7 +341,7 @@ const selectPdfFolder = async () => {
                         </div>
                         <div class="flex flex-col gap-1">
                             <label class="text-sm font-medium">Precio Mínimo</label>
-                            <InputNumber v-model="config.precio_minimo" :minFractionDigits="2" class="w-full" />
+                            <CampoNumero v-model="config.precio_minimo" :min-decimales="2" :max-decimales="2" />
                         </div>
                         <div class="flex flex-col gap-1">
                             <label class="text-sm font-medium">Color de Marca (Botones y acentos)</label>
@@ -316,15 +356,18 @@ const selectPdfFolder = async () => {
                     <div class="rounded-xl border border-black/[0.06] dark:border-white/[0.08] overflow-hidden">
                         <div class="px-4 py-2.5 border-b border-black/[0.06] dark:border-white/[0.08] flex items-baseline justify-between gap-2">
                             <span class="text-sm font-medium">Tarifario de mano de obra</span>
-                            <span class="text-xs text-surface-400">a {{ tarifaUnit(config.labor_cost_h) }}/h</span>
+                            <span class="text-xs text-surface-400">cada bloque a su propio coste/hora</span>
                         </div>
                         <div class="p-4 grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-4">
                             <div v-for="grupo in tarifario" :key="grupo.titulo" class="flex flex-col gap-1.5">
-                                <div class="text-[11px] uppercase font-semibold tracking-wide text-surface-400">{{ grupo.titulo }}</div>
+                                <div class="flex items-baseline justify-between gap-2">
+                                    <span class="text-[11px] uppercase font-semibold tracking-wide text-surface-400">{{ grupo.titulo }}</span>
+                                    <span class="text-[11px] font-mono text-surface-400">{{ tarifaUnit(grupo.costeH) }}/h</span>
+                                </div>
                                 <div v-for="t in grupo.filas" :key="t.value" class="flex items-baseline justify-between gap-3 text-sm">
                                     <span class="truncate text-surface-600 dark:text-surface-300">{{ t.label }}</span>
                                     <span class="font-mono shrink-0" :class="t.eur > 0 || t.custom ? 'text-amber-600 dark:text-amber-400' : 'text-surface-400'">
-                                        {{ t.custom ? tarifaUnit(config.labor_cost_h) + '/h' : tarifaUnit(t.eur) }}
+                                        {{ t.custom ? tarifaUnit(grupo.costeH) + '/h' : tarifaUnit(t.eur) }}
                                     </span>
                                 </div>
                                 <div class="text-[11px] text-surface-400 mt-0.5">{{ grupo.nota }}</div>
@@ -342,6 +385,25 @@ const selectPdfFolder = async () => {
                     <div class="flex items-center gap-3">
                         <Button label="Guardar Configuración" icon="pi pi-save" @click="saveConfig" />
                         <Message v-if="saved" severity="success" :closable="false">Guardado correctamente</Message>
+                    </div>
+
+                    <!-- Actualizaciones: la comprobación del arranque calla sus
+                         errores, así que ésta es la única forma de distinguir
+                         "no hay novedades" de "el canal está roto". -->
+                    <div v-if="isAndroidApp()" class="rounded-xl card-inset p-4 flex flex-col gap-2">
+                        <div class="flex items-center justify-between gap-3">
+                            <div>
+                                <div class="text-sm font-medium">Actualizaciones</div>
+                                <div class="text-[11px] text-surface-400">Instalación por sideload desde GitHub Releases</div>
+                            </div>
+                            <Button label="Buscar" icon="pi pi-refresh" size="small" outlined
+                                :loading="updateChecking" @click="manualUpdateCheck" />
+                        </div>
+                        <Message v-if="updateMessage" :severity="updateSeverity" :closable="false" class="!text-sm">
+                            {{ updateMessage }}
+                        </Message>
+                        <Button v-if="updateFound" :label="`Descargar e instalar ${updateFound.version}`"
+                            icon="pi pi-download" size="small" @click="$emit('install-update', updateFound)" />
                     </div>
                 </div>
             </TabPanel>
@@ -666,19 +728,19 @@ const selectPdfFolder = async () => {
             <div class="grid grid-cols-2 gap-3">
                 <div class="flex flex-col gap-1">
                     <label class="text-sm font-medium">Precio (€)</label>
-                    <InputNumber v-model="editingPrinter.price_eur" class="w-full" />
+                    <CampoNumero v-model="editingPrinter.price_eur" :max-decimales="2" />
                 </div>
                 <div class="flex flex-col gap-1">
                     <label class="text-sm font-medium">Consumo (kWh)</label>
-                    <InputNumber v-model="editingPrinter.energy_consumption_kwh" :minFractionDigits="3" class="w-full" />
+                    <CampoNumero v-model="editingPrinter.energy_consumption_kwh" :min-decimales="3" :max-decimales="3" />
                 </div>
                 <div class="flex flex-col gap-1">
                     <label class="text-sm font-medium">Vida útil (h)</label>
-                    <InputNumber v-model="editingPrinter.depreciation_time_h" class="w-full" />
+                    <CampoNumero v-model="editingPrinter.depreciation_time_h" :max-decimales="2" />
                 </div>
                 <div class="flex flex-col gap-1">
                     <label class="text-sm font-medium">Costes servicio (€)</label>
-                    <InputNumber v-model="editingPrinter.service_costs_life_eur" class="w-full" />
+                    <CampoNumero v-model="editingPrinter.service_costs_life_eur" :max-decimales="2" />
                 </div>
             </div>
         </div>
@@ -697,7 +759,7 @@ const selectPdfFolder = async () => {
             </div>
             <div class="flex flex-col gap-1">
                 <label class="text-sm font-medium">Precio por Kg (€)</label>
-                <InputNumber v-model="editingMaterial.price_per_kg" :minFractionDigits="2" class="w-full" />
+                <CampoNumero v-model="editingMaterial.price_per_kg" :min-decimales="2" :max-decimales="2" />
             </div>
         </div>
         <template #footer>

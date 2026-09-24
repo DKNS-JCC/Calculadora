@@ -1,0 +1,127 @@
+# Publica la APK firmada en la release que corresponde a la versión de
+# package.json. A partir de ahí la propia app la ve por la API de GitHub y se
+# ofrece a actualizarse (src/utils/androidUpdater.js).
+#
+# El disparador útil es el cambio de versión, no el push: Android sólo instala
+# encima si el versionCode SUBE, y aquí el versionCode sale de la versión de
+# package.json (android/app/build.gradle → loadAppVersion). Empujar dos veces
+# la misma versión produciría una APK que ningún móvil aceptaría, así que el
+# job se salta si la etiqueta ya existe.
+#
+# NO se usa el número de commits como versionCode (que es lo que recomienda la
+# guía): las versiones ya publicadas van por 70000 (7.0.0) y el contador de
+# commits está muy por debajo, así que el canal se rompería para siempre.
+#
+# Secrets necesarios en Settings → Secrets and variables → Actions → *Secrets*:
+#   ANDROID_KEYSTORE_BASE64   el .jks en base64   (base64 -w0 3dcalc-release.jks)
+#   ANDROID_KEYSTORE_PASSWORD
+#   ANDROID_KEY_ALIAS
+#   ANDROID_KEY_PASSWORD
+# Tienen que ser la MISMA clave con la que se firmó la APK ya instalada, o
+# Android rechaza la actualización con INSTALL_FAILED_UPDATE_INCOMPATIBLE.
+
+name: Release APK
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['**.md']
+  workflow_dispatch:
+
+concurrency:
+  group: release-apk
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Leer versión y decidir si hay algo que publicar
+        id: meta
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          TAG="v$VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::$TAG ya está publicada. Sube la versión en package.json para publicar una actualización."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Se publicará $TAG"
+          fi
+
+      - uses: actions/setup-node@v4
+        if: steps.meta.outputs.skip == 'false'
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: actions/setup-java@v4
+        if: steps.meta.outputs.skip == 'false'
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Restaurar el keystore
+        if: steps.meta.outputs.skip == 'false'
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          if [ -z "$KEYSTORE_B64" ]; then
+            echo "::error::Falta el secret ANDROID_KEYSTORE_BASE64 (ojo: pestaña Secrets, no Variables)."
+            exit 1
+          fi
+          echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.jks"
+          # Un base64 pegado a medias da un fichero que no es un keystore: se
+          # comprueba aquí para que el fallo no salga como un error de Gradle.
+          keytool -list -keystore "$RUNNER_TEMP/release.jks" \
+            -storepass "$STORE_PASSWORD" -alias "$KEY_ALIAS" >/dev/null \
+            || { echo "::error::El keystore no se pudo abrir: base64 truncado, contraseña o alias incorrectos."; exit 1; }
+          cat > android/keystore.properties <<EOF
+          storeFile=$RUNNER_TEMP/release.jks
+          storePassword=$STORE_PASSWORD
+          keyAlias=$KEY_ALIAS
+          keyPassword=$KEY_PASSWORD
+          EOF
+
+      - name: Compilar la APK firmada
+        if: steps.meta.outputs.skip == 'false'
+        run: |
+          npm ci
+          npx vite build
+          npx cap sync android
+          chmod +x android/gradlew
+          (cd android && ./gradlew --no-daemon assembleRelease)
+
+      - name: Comprobar la firma
+        if: steps.meta.outputs.skip == 'false'
+        run: |
+          APK=android/app/build/outputs/apk/release/app-release.apk
+          test -f "$APK" || { echo "::error::No se generó la APK."; exit 1; }
+          APKSIGNER=$(ls -d "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -1)
+          # Sin esto, una APK firmada en debug se publicaría igual y cada móvil
+          # la rechazaría con INSTALL_FAILED_UPDATE_INCOMPATIBLE.
+          "$APKSIGNER" verify --print-certs "$APK" | grep -i 'SHA-256 digest' \
+            || { echo "::error::La APK no está firmada con el keystore de release."; exit 1; }
+          mkdir -p dist-apk
+          cp "$APK" "dist-apk/3DCALC-${{ steps.meta.outputs.version }}.apk"
+
+      - name: Publicar la release
+        if: steps.meta.outputs.skip == 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: 3DCALC ${{ steps.meta.outputs.version }}
+          body: ${{ github.event.head_commit.message }}
+          files: dist-apk/*.apk

@@ -32,54 +32,58 @@ const darkMode = ref(localStorage.getItem('darkMode') !== 'false')
 const ghostLoading = ref(false)
 const activeTab = ref('0')
 
+/* Progreso de la descarga de la APK. Un toast de PrimeVue no vale: `toast.add`
+ * no devuelve el mensaje, así que no hay forma de irle cambiando el porcentaje.
+ * Con un ref y un aviso propio el número sí se mueve. */
+const updateDownload = ref(null)   // { version, pct } | null
+
 async function runAndroidUpdateFlow() {
     let result
     try {
         result = await checkForUpdate()
     } catch (e) {
+        // El arranque calla los errores a propósito: sin cobertura o con
+        // GitHub limitando peticiones, la app tiene que seguir funcionando.
+        // La comprobación manual de Ajustes sí cuenta lo que pasa.
         console.warn('Update check failed', e)
         return
     }
-    if (!result || !result.available) return
+    if (!result?.available) return
 
     confirm.require({
         header: 'Actualización disponible',
-        message: `Versión ${result.version} disponible (tienes la ${result.installed}). ¿Descargar e instalar ahora?`,
+        message: `Versión ${result.version} (tienes la ${result.installed}).\n\n`
+            + 'Se descarga y Android pedirá confirmación. Si sale un aviso de seguridad, '
+            + 'pulsa «Instalar de todos modos»: va firmada con la misma clave y tus datos se mantienen.',
         acceptLabel: 'Actualizar',
         rejectLabel: 'Más tarde',
-        accept: async () => {
-            const sticky = toast.add({
-                severity: 'info',
-                summary: 'Descargando actualización',
-                detail: '0%',
-                life: 0,
-                closable: false,
-            })
-            try {
-                await downloadAndInstall(result.asset, (pct) => {
-                    if (sticky) sticky.detail = `${Math.round(pct * 100)}%`
-                })
-                toast.removeAllGroups?.()
-                toast.add({
-                    severity: 'success',
-                    summary: 'Listo',
-                    detail: 'Confirma la instalación en el diálogo del sistema.',
-                    life: 6000,
-                })
-            } catch (e) {
-                toast.removeAllGroups?.()
-                toast.add({
-                    severity: 'error',
-                    summary: 'Error al actualizar',
-                    detail: e.message || 'No se pudo descargar el APK.',
-                    life: 8000,
-                })
-            }
-        },
-        reject: () => {
-            skipVersion(result.version)
-        },
+        accept: () => startUpdateDownload(result),
+        reject: () => skipVersion(result.version),
     })
+}
+
+async function startUpdateDownload(result) {
+    updateDownload.value = { version: result.version, pct: 0 }
+    try {
+        await downloadAndInstall(result.asset, (pct) => {
+            if (updateDownload.value) updateDownload.value.pct = pct
+        })
+        updateDownload.value = null
+        toast.add({
+            severity: 'success',
+            summary: 'Descarga lista',
+            detail: 'Confirma la instalación en el diálogo del sistema.',
+            life: 8000,
+        })
+    } catch (e) {
+        updateDownload.value = null
+        toast.add({
+            severity: 'error',
+            summary: 'No se pudo actualizar',
+            detail: e.message || 'Falló la descarga de la APK.',
+            life: 10000,
+        })
+    }
 }
 
 async function handleGhostToggle() {
@@ -195,6 +199,19 @@ async function onLoginSuccess({ uid, email, empresa }) {
     </Toast>
     <ConfirmDialog />
 
+    <!-- Descarga de la actualización de Android -->
+    <div v-if="updateDownload"
+        class="fixed bottom-4 left-1/2 -translate-x-1/2 z-[9999] w-[min(92vw,22rem)] rounded-2xl card px-4 py-3 shadow-lg">
+        <div class="flex items-center justify-between text-xs font-medium">
+            <span>Descargando {{ updateDownload.version }}…</span>
+            <span class="tabular-nums text-surface-500">{{ Math.round(updateDownload.pct * 100) }}%</span>
+        </div>
+        <div class="h-1.5 mt-2 rounded-full bg-black/[0.06] dark:bg-white/[0.08] overflow-hidden">
+            <div class="h-full rounded-full bg-primary transition-[width] duration-200"
+                :style="{ width: Math.max(2, updateDownload.pct * 100) + '%' }"></div>
+        </div>
+    </div>
+
     <!-- Loading spinner -->
     <div v-if="showSpinner" class="flex items-center justify-center h-screen bg-[#f5f5f7] dark:bg-[#0d0d0d]">
         <ProgressSpinner />
@@ -243,7 +260,7 @@ async function onLoginSuccess({ uid, email, empresa }) {
                 <TabPanel value="2"><Orders /></TabPanel>
                 <TabPanel value="3"><Inventory /></TabPanel>
                 <TabPanel value="4"><Statistics /></TabPanel>
-                <TabPanel value="5"><Configuration /></TabPanel>
+                <TabPanel value="5"><Configuration @install-update="startUpdateDownload" /></TabPanel>
             </TabPanels>
         </Tabs>
     </div>

@@ -8,7 +8,6 @@ import Button from 'primevue/button'
 import Tag from 'primevue/tag'
 import Dialog from 'primevue/dialog'
 import InputText from 'primevue/inputtext'
-import InputNumber from 'primevue/inputnumber'
 import Textarea from 'primevue/textarea'
 import Select from 'primevue/select'
 import Slider from 'primevue/slider'
@@ -20,9 +19,12 @@ import { useConfirm } from 'primevue/useconfirm'
 import OrderPurgeTable from './OrderPurgeTable.vue'
 import EmailNotifyDialog from './EmailNotifyDialog.vue'
 import WebQuotesInbox from './WebQuotesInbox.vue'
+import CampoNumero from './CampoNumero.vue'
+import CampoTiempo from './CampoTiempo.vue'
 import { useEmailConfirm } from '../composables/useEmailConfirm'
 import { useStaleOrders } from '../composables/useStaleOrders'
-import { laborOptions, DISENO_A_MEDIDA, MARKUP } from '../shared/backend.mjs'
+import { laborOptions, disenoCostH, DISENO_A_MEDIDA, MARKUP } from '../shared/backend.mjs'
+import { formatNumero, formatHoras } from '../shared/formatos.mjs'
 import { useIsHandheld } from '../composables/useMediaQuery'
 
 const selectedOrder = ref()
@@ -30,6 +32,23 @@ const selectedOrder = ref()
 /* Móvil y escritorio montan listas distintas, no la misma escondida con CSS. */
 const isHandheld = useIsHandheld()
 const cardLimit = ref(20)
+
+/* Cada dispositivo se queda con la foto que cargó al abrir: sin esto, lo que
+ * archivas en el móvil no aparece en el PC hasta reiniciarlo. */
+const recargando = ref(false)
+const recargar = async () => {
+    if (recargando.value) return
+    recargando.value = true
+    try {
+        await store.refresh()
+        selectedOrder.value = null
+        toast.add({ severity: 'success', summary: 'Datos actualizados', life: 1800 })
+    } catch (e) {
+        toast.add({ severity: 'error', summary: 'No se pudo recargar', detail: e.message, life: 5000 })
+    } finally {
+        recargando.value = false
+    }
+}
 const ordersForCards = computed(() => ordersForTable.value.slice(0, cardLimit.value))
 
 /* Señales que en la tabla eran iconos sueltos de 12 px imposibles de acertar. */
@@ -87,6 +106,7 @@ const ORDER_STATUS = [
     'Post-procesado',
     'Listo para entregar',
     'Entregado',
+    'Descartado',
 ]
 
 const orders = computed(() => store.appData.orders)
@@ -102,6 +122,7 @@ const total = computed(() => orders.value.length)
 const archivedCount = computed(() => orders.value.filter(o => o.archived).length)
 const activosCount = computed(() => orders.value.filter(o => !o.archived).length)
 const pendientesCount = computed(() => orders.value.filter(o => !o.archived && ['Presupuesto enviado', 'Enviado'].includes(o.estado)).length)
+const descartadosCount = computed(() => orders.value.filter(o => o.estado === 'Descartado').length)
 const enProduccionCount = computed(() => orders.value.filter(o => !o.archived && ['Aceptado', 'En producción', 'Post-procesado', 'Listo para entregar'].includes(o.estado)).length)
 
 const parseFechaTsRobust = (o) => {
@@ -419,6 +440,7 @@ const getSeverity = (status) => {
         'Post-procesado': 'help',
         'Listo para entregar': 'info',
         'Entregado': 'success',
+        'Descartado': 'secondary',
     }
     return map[status] || 'secondary'
 }
@@ -855,7 +877,7 @@ const exportBothOrderPdfs = async () => {
 /* ── Modify order (recalculate) ──────────────────────────────────────── */
 
 const editTarifas = computed(() => laborOptions(store.appData.global_config))
-const editLaborCostH = computed(() => Number(store.appData.global_config.labor_cost_h || 0))
+const editLaborCostH = computed(() => disenoCostH(store.appData.global_config))
 const editEsDisenoAMedida = computed(() => editForm.diseno_modelado === DISENO_A_MEDIDA)
 const editCantidadUds = computed(() => Math.max(1, Math.floor(Number(editForm.cantidad) || 1)))
 const editMarkupOptions = computed(() => Object.keys(MARKUP))
@@ -1164,8 +1186,9 @@ const saveModify = async () => {
                 outlined class="!w-11 !h-11 shrink-0"
                 @click="toggleShowArchived"
             />
-            <Button icon="pi pi-file-export" severity="secondary" outlined class="!w-11 !h-11 shrink-0"
-                aria-label="Exportar CSV" @click="exportCsv" />
+            <Button :icon="recargando ? 'pi pi-spin pi-spinner' : 'pi pi-refresh'" severity="secondary" outlined
+                class="!w-11 !h-11 shrink-0" aria-label="Recargar desde el servidor"
+                :disabled="recargando" @click="recargar" />
         </div>
 
         <!-- ═══ Toolbar (escritorio) ═══ -->
@@ -1193,6 +1216,8 @@ const saveModify = async () => {
                 <Divider layout="vertical" class="mx-1 !h-6 self-center" />
                 <Button :icon="compactMode ? 'pi pi-expand' : 'pi pi-compress'" severity="secondary" size="small" rounded text v-tooltip.bottom="compactMode ? 'Vista normal' : 'Vista compacta'" @click="toggleCompact" />
                 <Button icon="pi pi-file-export" severity="secondary" size="small" rounded text v-tooltip.bottom="'Exportar CSV'" @click="exportCsv" />
+                <Button :icon="recargando ? 'pi pi-spin pi-spinner' : 'pi pi-refresh'" severity="secondary" size="small" rounded text
+                    v-tooltip.bottom="'Recargar desde el servidor'" :disabled="recargando" @click="recargar" />
             </div>
             <div class="flex items-center gap-2">
                 <Button
@@ -1521,7 +1546,7 @@ const saveModify = async () => {
                         </div>
                         <div class="flex flex-col gap-1 col-span-full min-w-0">
                             <label class="text-[10px] text-surface-500 uppercase tracking-wider font-semibold">Repeticiones por error</label>
-                            <InputNumber v-model="detail.repeticiones_error" :min="0" :step="1" class="w-32" size="small" :disabled="isPartnerOrder" inputClass="text-center" v-tooltip.top="'Nº de reimpresiones por fallo (para estadísticas reales)'" />
+                            <CampoNumero v-model="detail.repeticiones_error" class="w-32" size="small" :disabled="isPartnerOrder" input-class="text-center" v-tooltip.top="'Nº de reimpresiones por fallo (para estadísticas reales)'" />
                         </div>
                         <div class="flex flex-col gap-1 col-span-full min-w-0">
                             <label class="text-[10px] text-surface-500 uppercase tracking-wider font-semibold">Notas internas</label>
@@ -1550,7 +1575,7 @@ const saveModify = async () => {
                         <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
                             <div class="flex flex-col gap-1 min-w-0">
                                 <label class="text-[10px] text-surface-500 uppercase tracking-wider font-semibold">Cobrado total</label>
-                                <InputNumber v-model="detail.importe_pagado" :min="0" :minFractionDigits="2" :maxFractionDigits="2" class="w-full" size="small" />
+                                <CampoNumero v-model="detail.importe_pagado" :min-decimales="2" :max-decimales="2" :unidad="unit" size="small" />
                             </div>
                             <div class="flex flex-col gap-1 min-w-0">
                                 <label class="text-[10px] text-surface-500 uppercase tracking-wider font-semibold">Método</label>
@@ -1623,7 +1648,7 @@ const saveModify = async () => {
                                 <span class="text-right text-surface-600 dark:text-surface-300 truncate">{{ selectedOrder.filamento || '—' }} ({{ selectedOrder.filamento_color || '—' }}) · {{ selectedOrder.peso_g }} g</span>
                                 <span class="font-medium text-right">{{ fmt(bdCost('Filamento')) }}</span>
                                 <span class="text-surface-400">Electricidad</span>
-                                <span class="text-right text-surface-600 dark:text-surface-300 truncate">{{ selectedOrder.horas }} h</span>
+                                <span class="text-right text-surface-600 dark:text-surface-300 truncate">{{ formatHoras(selectedOrder.horas) }}</span>
                                 <span class="font-medium text-right">{{ fmt(bdCost('Electricidad')) }}</span>
                                 <span class="text-surface-400">Impresora</span>
                                 <span class="text-right text-surface-600 dark:text-surface-300 truncate">{{ selectedOrder.impresora || '—' }}</span>
@@ -1867,16 +1892,16 @@ const saveModify = async () => {
                                 </Select>
                             </div>
                             <div class="flex flex-col gap-1 min-w-0">
-                                <label class="text-xs text-surface-400">Peso (g)</label>
-                                <InputNumber v-model="editForm.peso_g" :disabled="editForm.is_multimaterial" class="w-full" />
+                                <label class="text-xs text-surface-400">Peso</label>
+                                <CampoNumero v-model="editForm.peso_g" :max-decimales="2" unidad="g" :disabled="editForm.is_multimaterial" />
                             </div>
                             <div class="flex flex-col gap-1 min-w-0">
-                                <label class="text-xs text-surface-400">Tiempo (h)</label>
-                                <InputNumber v-model="editForm.tiempo_h" :minFractionDigits="1" class="w-full" />
+                                <label class="text-xs text-surface-400">Tiempo</label>
+                                <CampoTiempo v-model="editForm.tiempo_h" />
                             </div>
                             <div class="flex flex-col gap-1 min-w-0">
-                                <label class="text-xs text-surface-400">Cantidad (ud.)</label>
-                                <InputNumber v-model="editForm.cantidad" :min="1" :step="1" class="w-full" />
+                                <label class="text-xs text-surface-400">Cantidad</label>
+                                <CampoNumero v-model="editForm.cantidad" :min="1" unidad="ud." />
                             </div>
                         </div>
                         <div class="flex items-center gap-3 mt-3 p-2 bg-surface-100 dark:bg-surface-800 rounded-lg">
@@ -1906,7 +1931,7 @@ const saveModify = async () => {
                                 </div>
                                 <div class="flex flex-col gap-1 w-20">
                                     <label v-if="idx === 0" class="text-[11px] text-surface-400">Peso (g)</label>
-                                    <InputNumber v-model="line.grams" placeholder="g" suffix=" g" class="w-full" />
+                                    <CampoNumero v-model="line.grams" :max-decimales="2" placeholder="g" />
                                 </div>
                                 <div class="flex flex-col gap-1 w-20 shrink-0">
                                     <label v-if="idx === 0" class="text-[11px] text-surface-400">Gasto</label>
@@ -1915,7 +1940,7 @@ const saveModify = async () => {
                                 <Button v-if="editMixLines.length > 2" icon="pi pi-times" size="small" text severity="danger" class="shrink-0 mb-0.5" @click="removeEditMixLine(idx)" v-tooltip.top="'Quitar'" />
                             </div>
                             <div class="flex items-center justify-between mt-2 pt-2 border-t border-amber-200 dark:border-amber-700">
-                                <span class="text-xs text-surface-500">Total: <strong>{{ editMixTotalGrams.toFixed(0) }} g</strong></span>
+                                <span class="text-xs text-surface-500">Total: <strong>{{ formatNumero(editMixTotalGrams) }} g</strong></span>
                                 <span class="text-sm font-mono font-bold text-amber-600 dark:text-amber-400">{{ editMixTotalCost.toFixed(2) }} {{ editUnit }}</span>
                             </div>
                         </div>
@@ -1942,8 +1967,7 @@ const saveModify = async () => {
                                         </div>
                                     </template>
                                 </Select>
-                                <InputNumber v-if="editEsDisenoAMedida" v-model="editForm.diseno_horas" :min="0" :step="0.25"
-                                    :minFractionDigits="0" :maxFractionDigits="2" suffix=" h" class="w-full mt-1" />
+                                <CampoTiempo v-if="editEsDisenoAMedida" v-model="editForm.diseno_horas" class="mt-1" />
                             </div>
                             <div class="flex flex-col gap-1 col-span-full min-w-0">
                                 <label class="text-xs text-surface-400 flex items-center justify-between gap-2">
@@ -2007,9 +2031,8 @@ const saveModify = async () => {
                         <div class="text-xs font-semibold text-surface-500 uppercase tracking-wide mb-2 flex items-center gap-1">
                             <i class="pi pi-tag text-xs" /> Extras / Misceláneos
                         </div>
-                        <InputNumber v-model="editForm.gasto_misc" :min="0" :minFractionDigits="2" :maxFractionDigits="2"
-                            class="w-full" placeholder="Anillas, llaveros, embalaje..." />
-                        <small class="text-surface-400 mt-1 block">Importe directo añadido al precio final (sin markup)</small>
+                        <CampoNumero v-model="editForm.gasto_misc" :min-decimales="2" :max-decimales="2" :unidad="unit" />
+                        <small class="text-surface-400 mt-1 block">Anillas, llaveros, embalaje… Importe directo añadido al precio final (sin markup)</small>
                     </div>
 
                     <!-- Price comparison -->
@@ -2065,7 +2088,7 @@ const saveModify = async () => {
             <div class="text-sm text-surface-500">Pendiente: <strong>{{ fmt(linkDialog.pending) }}</strong></div>
             <div class="flex flex-col gap-1 min-w-0">
                 <label class="text-xs text-surface-500 uppercase tracking-wider font-semibold">Importe a cobrar</label>
-                <InputNumber v-model="linkDialog.amount" :min="0.01" :minFractionDigits="2" :maxFractionDigits="2" class="w-full" />
+                <CampoNumero v-model="linkDialog.amount" :min="0.01" :min-decimales="2" :max-decimales="2" :unidad="unit" />
                 <small class="text-surface-400">Puede ser mayor que el pendiente (incluye propina)</small>
             </div>
         </div>

@@ -7,25 +7,16 @@
  */
 import { computed } from 'vue'
 import { store } from '../store'
+import { AUTO_DISCARD_DAYS, ORDER_DISCARDED, lastUpdateTs, isStaleQuote } from '../shared/backend.mjs'
 
 export const STALE_MS = 7 * 24 * 60 * 60 * 1000
 
-export function lastUpdateTs(o) {
-    for (const c of [o.last_status_update, o.created_at]) {
-        if (!c) continue
-        const t = new Date(c).getTime()
-        if (!Number.isNaN(t)) return t
-    }
-    // Fallback: fecha del pedido (YYYY-MM-DD o DD/MM/YYYY)
-    const f = String(o.fecha || '')
-    if (/^\d{4}-\d{2}-\d{2}$/.test(f)) return new Date(f + 'T00:00:00').getTime()
-    const p = f.split('/')
-    if (p.length === 3) {
-        const t = new Date(Number(p[2]), Number(p[1]) - 1, Number(p[0])).getTime()
-        if (!Number.isNaN(t)) return t
-    }
-    return 0
-}
+/** Umbral de auto-descarte para presupuestos sin respuesta (15 días). */
+export const AUTO_DISCARD_MS = AUTO_DISCARD_DAYS * 24 * 60 * 60 * 1000
+
+// Re-export: la lógica pura vive en backend.mjs (sin dependencia del store,
+// para que store.js pueda importarla sin ciclo).
+export { lastUpdateTs, isStaleQuote, ORDER_DISCARDED, AUTO_DISCARD_DAYS }
 
 export function useStaleOrders() {
     const staleOrders = computed(() =>
@@ -49,8 +40,9 @@ export function useStaleOrders() {
     const rejectStale = (o) => store.updateOrder({
         orderId: o.id,
         updates: {
+            estado: ORDER_DISCARDED,
             archived: true,
-            notes: (o.notes ? o.notes + '\n' : '') + `[RECHAZADO el ${new Date().toLocaleDateString('es-ES')}]`,
+            notes: (o.notes ? o.notes + '\n' : '') + `[DESCARTADO el ${new Date().toLocaleDateString('es-ES')}]`,
         },
     }, { skipNotification: true })
 

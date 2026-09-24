@@ -13,6 +13,8 @@
 
 const fs = require('fs');
 const PDFDocument = require('pdfkit');
+const path = require('path');
+const { formatHoras } = require(path.join(__dirname, '..', 'src', 'shared', 'formatos.mjs'));
 
 /* ── Static palette (structural greys + internal-sheet accent) ───────────── */
 const COL = {
@@ -313,7 +315,7 @@ function renderClientPdf(doc, summary, brand) {
     { label: 'DESCRIPCIÓN', value: asText(info.descripcion) },
     { label: 'MATERIAL', value: `${asText(info.filamento)} (${asText(info.filamento_color)})` },
     { label: 'PESO ESTIMADO', value: `${asText(info.peso, '0')} g` },
-    { label: 'TIEMPO DE IMPRESORA', value: `${asText(info.horas, '0')} h` },
+    { label: 'TIEMPO DE IMPRESORA', value: asText(formatHoras(info.horas), '0 h') },
     { label: 'ENTREGA', value: info.urgencia_nivel === 'Normal' ? 'Plazo estándar' : 'Urgente — Lo antes posible' },
   ];
   if (cantidad > 1) {
@@ -380,7 +382,7 @@ function renderCompanyPdf(doc, summary) {
     { label: 'MATERIAL', value: `${asText(info.filamento)} (${asText(info.filamento_color)})` },
     { label: 'PRECIO MATERIAL', value: formatMoney(info.precio_kg, `${unit}/kg`) },
     { label: 'PESO', value: `${asText(info.peso, '0')} g` },
-    { label: 'TIEMPO', value: `${asText(info.horas, '0')} h` },
+    { label: 'TIEMPO', value: asText(formatHoras(info.horas), '0 h') },
     { label: 'URGENCIA', value: asText(info.urgencia_nivel, 'Normal') },
     ...(cantidad > 1 ? [{ label: 'CANTIDAD', value: `${cantidad} ud.` }] : []),
   ], y);
