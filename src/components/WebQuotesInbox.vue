@@ -1,7 +1,15 @@
 <script setup>
-import { ref, onMounted, computed } from 'vue'
+/**
+ * Solicitudes del tasador web pendientes de presupuestar.
+ *
+ * Desde la migración 0027 cada solicitud llega YA como pedido en 'Nuevo'
+ * (Supabase lo crea con los gramos, horas y coste estimados). Esta bandeja es
+ * esa lista de pedidos filtrada, con los datos de la solicitud (archivos,
+ * mensaje, entrega) que viven en su quote.
+ */
+import { ref, computed, watch } from 'vue'
 import { store } from '../store'
-import { loadWebQuotes, rejectWebQuote, notifyWebQuote, quoteFileUrl } from '../supabaseService'
+import { loadQuotesByIds, notifyOrder, quoteFileUrl } from '../supabaseService'
 import { api, isMobile } from '../platform'
 import Button from 'primevue/button'
 import Tag from 'primevue/tag'
@@ -10,33 +18,51 @@ import { useConfirm } from 'primevue/useconfirm'
 
 const toast = useToast()
 const confirm = useConfirm()
-const quotes = ref([])
+const quotesById = ref({})
 const loading = ref(false)
 const errorMsg = ref('')
 const collapsed = ref(false)
 const expandedId = ref(null)
 const rejecting = ref(null)
 
-const ESTADO_META = {
-  nuevo: { label: 'Nuevo', severity: 'info' },
-  revisado: { label: 'Revisado', severity: 'secondary' },
-  aceptado: { label: 'Aceptado por cliente', severity: 'success' },
-}
+/** Pedidos en 'Nuevo' que vienen de una solicitud web. */
+const pedidos = computed(() =>
+  (store.appData?.orders || [])
+    .filter((o) => !o._fromPartner && !o.archived && o.quote_id && o.estado === 'Nuevo')
+    .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at))),
+)
 
-async function refresh() {
+async function cargarQuotes() {
+  const ids = pedidos.value.map((o) => o.quote_id).filter((id) => !quotesById.value[id])
+  if (!ids.length) return
   loading.value = true
   errorMsg.value = ''
   try {
-    quotes.value = await loadWebQuotes()
-    store.webQuotesCount = quotes.value.length
+    const rows = await loadQuotesByIds(ids)
+    const next = { ...quotesById.value }
+    for (const q of rows) next[q.id] = q
+    quotesById.value = next
   } catch (e) {
-    errorMsg.value = e.message || 'No se pudieron cargar los presupuestos web.'
+    errorMsg.value = e.message || 'No se pudieron cargar las solicitudes web.'
   } finally {
     loading.value = false
   }
 }
 
-onMounted(refresh)
+watch(() => pedidos.value.map((o) => o.quote_id).join(','), cargarQuotes, { immediate: true })
+
+async function refresh() {
+  loading.value = true
+  try {
+    await store.refresh()
+  } catch (e) {
+    errorMsg.value = e.message
+  } finally {
+    loading.value = false
+  }
+}
+
+const quoteDe = (o) => quotesById.value[o.quote_id] || null
 
 const fmtMoney = (v) => `${Number(v || 0).toFixed(2)} €`
 const fmtFecha = (iso) => {
@@ -51,27 +77,17 @@ const fmtBytes = (b) => {
 }
 
 function diasRestantes(q) {
-  const t = new Date(q.valido_hasta).getTime()
+  const t = new Date(q?.valido_hasta).getTime()
   if (isNaN(t)) return null
   return Math.ceil((t - Date.now()) / 86400000)
 }
 
 function archivos(q) {
-  return Array.isArray(q.archivos) ? q.archivos.filter((f) => f && f.path) : []
-}
-
-function piezas(q) {
-  const files = archivos(q)
-  if (!files.length) return Math.max(1, Number(q.cantidad || 1))
-  return files.reduce((acc, f) => acc + Math.max(1, Number(f?.cantidad || 1)), 0)
-}
-
-function precioRef(q) {
-  return q.precio_final != null ? Number(q.precio_final) : Number(q.precio_total || 0)
+  return Array.isArray(q?.archivos) ? q.archivos.filter((f) => f && f.path) : []
 }
 
 function direccion(q) {
-  const d = q.direccion || {}
+  const d = q?.direccion || {}
   return [d.calle, d.cp, d.ciudad, d.provincia].filter(Boolean).join(', ')
 }
 
@@ -80,63 +96,51 @@ const abrirDescarga = (f) => api.openUrl(quoteFileUrl(f, { download: true }))
 const abrirEnOrca = (f) => api.openUrl(`orcaslicer://open?file=${encodeURIComponent(quoteFileUrl(f))}`)
 const abrirEnBambu = (f) => api.openUrl(`bambustudio://open?file=${encodeURIComponent(quoteFileUrl(f))}`)
 
-/* ── Usar en calculadora ── */
-function buildPrefill(q) {
-  const files = archivos(q)
-  let peso = 0
-  let tiempo = 0
-  for (const f of files) {
-    const cant = Math.max(1, Number(f?.cantidad || 1))
-    peso += Number(f?.metricas?.peso_g || 0) * cant
-    tiempo += Number(f?.metricas?.tiempo_h || 0) * cant
-  }
-  if (!peso) peso = Number(q?.metricas?.peso_g || 0) * Math.max(1, Number(q.cantidad || 1))
-  if (!tiempo) tiempo = Number(q?.metricas?.tiempo_h || 0) * Math.max(1, Number(q.cantidad || 1))
-
-  const nombres = files.map((f) => String(f?.nombre || '').trim()).filter(Boolean)
+/* ── Presupuestar en la calculadora ── */
+function buildPrefill(o) {
   return {
-    cliente: String(q.nombre || '').trim(),
-    cliente_email: String(q.email || '').trim(),
-    descripcion: `${q.codigo}${nombres.length ? ' · ' + nombres.join(', ') : ' · presupuesto web'}`,
-    filamento_tipo: String(q.material || '').trim(),
-    filamento_color: String(q.colores?.[0]?.nombre || '').trim(),
-    peso_g: Math.round(peso) || null,
-    tiempo_h: tiempo ? Math.round(tiempo * 10) / 10 : null,
-    precio_web: precioRef(q),
+    cliente: String(o.cliente || '').trim(),
+    cliente_email: String(o.cliente_email || '').trim(),
+    descripcion: String(o.descripcion || '').trim(),
+    filamento_tipo: String(o.filamento || '').trim(),
+    filamento_color: String(o.filamento_color || '').trim(),
+    peso_g: Math.round(Number(o.peso_g) || 0) || null,
+    tiempo_h: Number(o.horas) ? Math.round(Number(o.horas) * 10) / 10 : null,
+    precio_web: Number(o.precio_final || 0),
   }
 }
 
-function usarEnCalculadora(q) {
-  store.pendingWebQuote = { id: q.id, codigo: q.codigo, prefill: buildPrefill(q) }
+function usarEnCalculadora(o) {
+  store.pendingWebQuote = { id: o.quote_id, codigo: o._webCodigo || '', orderId: o.id, prefill: buildPrefill(o) }
   toast.add({
     severity: 'info',
-    summary: `${q.codigo} → Calculadora`,
-    detail: 'Datos precargados. Recalcula con tus costes reales y guarda el pedido para enlazarlo.',
+    summary: `${o._webCodigo || o.id} → Calculadora`,
+    detail: 'Datos precargados. Recalcula con tus costes reales y guarda: se actualiza este mismo pedido y pasa a «Presupuesto enviado».',
     life: 6000,
   })
 }
 
 /* ── Rechazar ── */
-function rechazar(q) {
+function rechazar(o) {
   confirm.require({
-    header: `Rechazar ${q.codigo}`,
-    message: `Se marcará como rechazada y se avisará a ${q.nombre} por email con la plantilla de la web. ¿Continuar?`,
+    header: `Rechazar ${o._webCodigo || o.id}`,
+    message: `Pasará a «Descartado» (en la web, rechazada) y se avisará a ${o.cliente} por email con la plantilla de la web. ¿Continuar?`,
     acceptLabel: 'Rechazar y avisar',
     rejectLabel: 'Cancelar',
     acceptProps: { severity: 'danger' },
     accept: async () => {
-      rejecting.value = q.id
+      rejecting.value = o.id
       try {
-        const res = await rejectWebQuote(q.id)
-        if (!res.ok) throw new Error('La solicitud ya no está activa (¿aceptada o caducada?).')
-        const mail = await notifyWebQuote(q.id)
+        await store.updateOrder({ orderId: o.id, updates: { estado: 'Descartado' } }, { skipNotification: true })
+        // Descartar no avisa por norma (limpieza interna); rechazar una
+        // solicitud sí, a propósito.
+        const mail = o.cliente_email ? await notifyOrder(store.empresa, o.id) : { ok: false, error: 'sin email' }
         toast.add({
           severity: mail.ok ? 'success' : 'warn',
-          summary: `${q.codigo} rechazado`,
-          detail: mail.ok ? 'Cliente avisado por email.' : `Rechazado, pero el email falló: ${mail.error}`,
+          summary: `${o._webCodigo || o.id} rechazada`,
+          detail: mail.ok ? 'Cliente avisado por email.' : `Rechazada, pero el email falló: ${mail.error}`,
           life: 6000,
         })
-        await refresh()
       } catch (e) {
         toast.add({ severity: 'error', summary: 'Error', detail: e.message, life: 6000 })
       } finally {
@@ -146,7 +150,7 @@ function rechazar(q) {
   })
 }
 
-const titulo = computed(() => `Presupuestos web${quotes.value.length ? ` (${quotes.value.length})` : ''}`)
+const titulo = computed(() => `Solicitudes web${pedidos.value.length ? ` (${pedidos.value.length})` : ''}`)
 const mobile = isMobile()
 </script>
 
@@ -155,7 +159,7 @@ const mobile = isMobile()
     <div class="flex items-center gap-2">
       <i class="pi pi-globe text-sky-600 dark:text-sky-300" />
       <span class="text-sm font-semibold text-sky-700 dark:text-sky-300">{{ titulo }}</span>
-      <span class="text-[10px] text-surface-400 dark:text-white/30 hidden sm:inline">solicitudes del tasador de impresion3dcc.com sin pedido</span>
+      <span class="text-[10px] text-surface-400 dark:text-white/30 hidden sm:inline">pedidos del tasador de impresion3dcc.com en «Nuevo»</span>
       <div class="ml-auto flex items-center gap-1">
         <Button :icon="loading ? 'pi pi-spin pi-spinner' : 'pi pi-refresh'" text rounded severity="secondary"
           class="!w-11 !h-11 lg:!w-8 lg:!h-8" aria-label="Actualizar solicitudes web"
@@ -168,40 +172,43 @@ const mobile = isMobile()
 
     <div v-if="!collapsed" class="flex flex-col gap-1.5">
       <div v-if="errorMsg" class="text-xs text-red-500 px-1">{{ errorMsg }}</div>
-      <div v-else-if="!loading && !quotes.length" class="text-xs text-surface-400 dark:text-white/30 px-1">
+      <div v-else-if="!pedidos.length" class="text-xs text-surface-400 dark:text-white/30 px-1">
         No hay solicitudes web pendientes.
       </div>
 
-      <div v-for="q in quotes" :key="q.id" class="rounded-xl bg-white/70 dark:bg-black/20 overflow-hidden">
+      <div v-for="o in pedidos" :key="o.id" class="rounded-xl bg-white/70 dark:bg-black/20 overflow-hidden">
         <!-- Fila principal -->
-        <div class="flex flex-wrap items-center gap-2 px-3 py-2 cursor-pointer" @click="expandedId = expandedId === q.id ? null : q.id">
-          <i :class="expandedId === q.id ? 'pi pi-chevron-down' : 'pi pi-chevron-right'" class="text-[10px] text-surface-400" />
-          <span class="font-mono text-xs font-bold text-sky-600 dark:text-sky-300">{{ q.codigo }}</span>
-          <Tag :value="ESTADO_META[q.estado]?.label || q.estado" :severity="ESTADO_META[q.estado]?.severity || 'secondary'" class="text-[9px] px-1.5 py-0" />
-          <span class="text-sm font-medium">{{ q.nombre }}</span>
-          <span class="text-xs text-surface-500">{{ q.material }} · {{ piezas(q) }} pza{{ piezas(q) !== 1 ? 's' : '' }}</span>
-          <span v-if="q.entrega === 'envio'" class="text-[10px] text-surface-400"><i class="pi pi-truck text-[9px]" /> envío</span>
-          <Tag v-if="diasRestantes(q) !== null && diasRestantes(q) <= 3" :value="diasRestantes(q) <= 0 ? 'Caducado' : `Caduca en ${diasRestantes(q)} d`" severity="danger" class="text-[9px] px-1.5 py-0" />
-          <span class="text-[10px] text-surface-400 ml-auto">{{ fmtFecha(q.created_at) }}</span>
-          <span class="text-sm font-semibold whitespace-nowrap">{{ fmtMoney(precioRef(q)) }}</span>
-          <Button label="Usar en calculadora" icon="pi pi-calculator" outlined
-            class="!h-11 lg:!h-8 w-full sm:w-auto shrink-0" @click.stop="usarEnCalculadora(q)" />
+        <div class="flex flex-wrap items-center gap-2 px-3 py-2 cursor-pointer" @click="expandedId = expandedId === o.id ? null : o.id">
+          <i :class="expandedId === o.id ? 'pi pi-chevron-down' : 'pi pi-chevron-right'" class="text-[10px] text-surface-400" />
+          <span class="font-mono text-xs font-bold text-sky-600 dark:text-sky-300">{{ o._webCodigo || o.id }}</span>
+          <Tag value="Nuevo" severity="contrast" class="text-[9px] px-1.5 py-0" />
+          <span class="text-sm font-medium">{{ o.cliente }}</span>
+          <span class="text-xs text-surface-500">{{ o.filamento }} · {{ o.cantidad }} pza{{ Number(o.cantidad) !== 1 ? 's' : '' }}</span>
+          <span v-if="quoteDe(o)?.entrega === 'envio'" class="text-[10px] text-surface-400"><i class="pi pi-truck text-[9px]" /> envío</span>
+          <Tag v-if="diasRestantes(quoteDe(o)) !== null && diasRestantes(quoteDe(o)) <= 3"
+            :value="diasRestantes(quoteDe(o)) <= 0 ? 'Caducado' : `Caduca en ${diasRestantes(quoteDe(o))} d`"
+            severity="danger" class="text-[9px] px-1.5 py-0" />
+          <span class="text-[10px] text-surface-400 ml-auto">{{ fmtFecha(o.created_at) }}</span>
+          <span class="text-sm font-semibold whitespace-nowrap" v-tooltip.top="'Precio estimado en la web'">{{ fmtMoney(o.precio_final) }}</span>
+          <Button label="Presupuestar" icon="pi pi-calculator" outlined
+            class="!h-11 lg:!h-8 w-full sm:w-auto shrink-0" @click.stop="usarEnCalculadora(o)" />
         </div>
 
         <!-- Detalle expandido -->
-        <div v-if="expandedId === q.id" class="px-4 pb-3 pt-1 flex flex-col gap-2 border-t border-black/[0.05] dark:border-white/[0.06]">
+        <div v-if="expandedId === o.id" class="px-4 pb-3 pt-1 flex flex-col gap-2 border-t border-black/[0.05] dark:border-white/[0.06]">
           <div class="flex flex-wrap gap-x-6 gap-y-1 text-xs text-surface-600 dark:text-white/60">
-            <span><i class="pi pi-envelope text-[10px] mr-1" />{{ q.email }}</span>
-            <span v-if="q.telefono"><i class="pi pi-phone text-[10px] mr-1" />{{ q.telefono }}</span>
-            <span v-if="q.entrega === 'envio' && direccion(q)"><i class="pi pi-truck text-[10px] mr-1" />{{ direccion(q) }}</span>
-            <span v-if="q.entrega === 'recogida'"><i class="pi pi-map-marker text-[10px] mr-1" />Recogida en Salamanca</span>
-            <span v-if="diasRestantes(q) !== null"><i class="pi pi-clock text-[10px] mr-1" />Válido hasta {{ fmtFecha(q.valido_hasta) }}</span>
+            <span><i class="pi pi-envelope text-[10px] mr-1" />{{ o.cliente_email }}</span>
+            <span v-if="quoteDe(o)?.telefono"><i class="pi pi-phone text-[10px] mr-1" />{{ quoteDe(o).telefono }}</span>
+            <span v-if="quoteDe(o)?.entrega === 'envio' && direccion(quoteDe(o))"><i class="pi pi-truck text-[10px] mr-1" />{{ direccion(quoteDe(o)) }}</span>
+            <span v-if="quoteDe(o)?.entrega === 'recogida'"><i class="pi pi-map-marker text-[10px] mr-1" />Recogida en Salamanca</span>
+            <span v-if="diasRestantes(quoteDe(o)) !== null"><i class="pi pi-clock text-[10px] mr-1" />Válido hasta {{ fmtFecha(quoteDe(o).valido_hasta) }}</span>
+            <span><i class="pi pi-box text-[10px] mr-1" />{{ o.peso_g }} g · {{ o.horas }} h estimados</span>
           </div>
-          <p v-if="q.mensaje" class="text-xs text-surface-500 dark:text-white/50 italic m-0">“{{ q.mensaje }}”</p>
+          <p v-if="quoteDe(o)?.mensaje" class="text-xs text-surface-500 dark:text-white/50 italic m-0">“{{ quoteDe(o).mensaje }}”</p>
 
           <!-- Archivos -->
-          <div v-if="archivos(q).length" class="flex flex-col gap-1">
-            <div v-for="(f, i) in archivos(q)" :key="i" class="flex flex-wrap items-center gap-2 px-2 py-1.5 rounded-lg bg-black/[0.03] dark:bg-white/[0.04]">
+          <div v-if="archivos(quoteDe(o)).length" class="flex flex-col gap-1">
+            <div v-for="(f, i) in archivos(quoteDe(o))" :key="i" class="flex flex-wrap items-center gap-2 px-2 py-1.5 rounded-lg bg-black/[0.03] dark:bg-white/[0.04]">
               <i class="pi pi-box text-xs text-surface-400" />
               <span class="text-xs font-medium truncate max-w-[16rem]" :title="f.nombre">{{ f.nombre }}</span>
               <span class="text-[10px] text-surface-400">{{ fmtBytes(f.tamano_original || f.tamano) }}<template v-if="f.cantidad > 1"> · ×{{ f.cantidad }}</template></span>
@@ -213,10 +220,10 @@ const mobile = isMobile()
               </div>
             </div>
           </div>
-          <div v-else class="text-[11px] text-surface-400">Sin archivos adjuntos.</div>
+          <div v-else-if="quoteDe(o)" class="text-[11px] text-surface-400">Sin archivos adjuntos.</div>
 
           <div class="flex justify-end">
-            <Button label="Rechazar" icon="pi pi-times" size="small" text severity="danger" :loading="rejecting === q.id" @click="rechazar(q)" />
+            <Button label="Rechazar" icon="pi pi-times" size="small" text severity="danger" :loading="rejecting === o.id" @click="rechazar(o)" />
           </div>
         </div>
       </div>

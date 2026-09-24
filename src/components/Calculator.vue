@@ -622,7 +622,7 @@ const barOpts = {
 
 const _decideEmailForNew = async () => {
     const email = String(form.cliente_email || '').trim()
-    const emailEnabled = !!store.appData.global_config?.email_enabled
+    const emailEnabled = store.puedeAvisar()
     if (!email || !emailEnabled) return { proceed: true, options: {} }
     const fakeOrder = {
         id: '——',
@@ -648,8 +648,43 @@ const _decideEmailForNew = async () => {
     return { proceed: true, options: {} }
 }
 
+const _payloadActual = () => JSON.parse(JSON.stringify({
+    ...form,
+    material_breakdown: materialBreakdown(),
+    partner_printers: partnerPrintersPayload(),
+    deterioro_impresora: 'Autofinanciación',
+}))
+
+/* Solicitud web precargada: su pedido ya existe (lo creó Supabase al llegar),
+ * así que se recalcula ese mismo y pasa a 'Presupuesto enviado'. */
+const presupuestarSolicitud = async () => {
+    const pending = store.pendingWebQuote
+    const decision = await _decideEmailForNew()
+    if (!decision.proceed) {
+        toast.add({ severity: 'secondary', summary: 'Guardado cancelado', life: 2200 })
+        return
+    }
+    try {
+        const res = await store.presupuestarSolicitud({ orderId: pending.orderId, payload: _payloadActual() }, decision.options)
+        const aviso = decision.options.skipNotification || !form.cliente_email
+            ? '(sin notificación)'
+            : '· avisando al cliente con el PDF…'
+        toast.add({
+            severity: 'success',
+            summary: `${pending.codigo || pending.orderId} presupuestado`,
+            detail: `${formatMoney(res.newPrice)} ${aviso}`,
+            life: 4000,
+        })
+    } catch (e) {
+        toast.add({ severity: 'error', summary: 'Error', detail: e.message, life: 5000 })
+    }
+}
+
 const saveOrder = async () => {
     if (!result.value) return
+    if (store.pendingWebQuote?.orderId && store.appData.orders.some((o) => o.id === store.pendingWebQuote.orderId)) {
+        return presupuestarSolicitud()
+    }
     const info = result.value.info || {}
     const clienteNorm = String(info.cliente || '').trim().toLowerCase()
     const descNorm = String(info.descripcion || '').trim().toLowerCase()
@@ -685,7 +720,7 @@ const saveOrder = async () => {
                 const res = await store.saveOrderFromResult(result.value, decision.options)
                 if (decision.options.skipNotification) {
                     toast.add({ severity: 'info', summary: 'Guardado', detail: `Pedido #${res.order.id} (sin notificación).`, life: 3000 })
-                } else if (form.cliente_email && store.appData.global_config?.email_enabled) {
+                } else if (form.cliente_email && store.puedeAvisar()) {
                     toast.add({ severity: 'success', summary: 'Guardado', detail: `Pedido #${res.order.id} · Enviando email + PDF…`, life: 3500 })
                 } else {
                     toast.add({ severity: 'success', summary: 'Guardado', detail: `Pedido #${res.order.id}`, life: 3000 })
@@ -701,7 +736,7 @@ const saveOrder = async () => {
         const res = await store.saveOrderFromResult(result.value, decision.options)
         if (decision.options.skipNotification) {
             toast.add({ severity: 'info', summary: 'Guardado', detail: `Pedido #${res.order.id} (sin notificación).`, life: 3000 })
-        } else if (form.cliente_email && store.appData.global_config?.email_enabled) {
+        } else if (form.cliente_email && store.puedeAvisar()) {
             toast.add({ severity: 'success', summary: 'Guardado', detail: `Pedido #${res.order.id} · Enviando email + PDF…`, life: 3500 })
         } else {
             toast.add({ severity: 'success', summary: 'Guardado', detail: `Pedido #${res.order.id}`, life: 3000 })
@@ -782,7 +817,7 @@ const exportBothPdfs = async () => {
                     · precio estimado en la web: <strong>{{ formatMoney(store.pendingWebQuote.prefill.precio_web) }}</strong>
                 </template>
             </span>
-            <span class="text-xs text-surface-400 dark:text-white/30">al guardar el pedido quedará enlazado y la web se actualizará sola</span>
+            <span class="text-xs text-surface-400 dark:text-white/30">al guardar se actualiza su pedido y pasa a «Presupuesto enviado»</span>
             <Button label="Descartar" icon="pi pi-times" size="small" text severity="secondary" class="ml-auto" @click="descartarWebQuote" />
         </div>
 
