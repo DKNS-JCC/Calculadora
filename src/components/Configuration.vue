@@ -75,6 +75,11 @@ const tarifario = computed(() => {
 const emailTesting = ref(false)
 const emailTestTo = ref('')
 
+/* 3DCC manda los correos desde Supabase (notify-quote / recibo-emitir): mismas
+ * plantillas y remitente que la web, en escritorio y en móvil, y la contraseña
+ * de Gmail vive solo en el servidor. SILAB3D sigue con su propio Gmail. */
+const correoServidor = computed(() => store.empresa === '3DCC')
+
 const ensureEmailDefaults = () => {
     const c = config.value
     if (c.email_enabled === undefined) c.email_enabled = false
@@ -181,6 +186,9 @@ const handleLogout = async () => {
 
 const saveConfig = async () => {
     try {
+        // La contraseña de Gmail ya no hace falta en 3DCC: que no viaje en la
+        // config (la lee también la empresa socia).
+        if (correoServidor.value && config.value.email_app_password) config.value.email_app_password = ''
         await store.saveApp()
         saved.value = true
         setTimeout(() => saved.value = false, 2000)
@@ -499,9 +507,17 @@ const selectPdfFolder = async () => {
                                 (presupuesto enviado, aceptado, en producción, post-procesado, listo para entregar, entregado).
                             </p>
                         </div>
-                        <ToggleSwitch v-model="config.email_enabled" />
+                        <ToggleSwitch v-if="!correoServidor" v-model="config.email_enabled" />
                     </div>
 
+                    <Message v-if="correoServidor" severity="success" :closable="false">
+                        Los correos de <strong>3DCC</strong> salen del servidor (Supabase), con las mismas plantillas y el mismo
+                        remitente que la web, también desde el móvil. Aquí no hace falta ninguna contraseña: al guardar se borra
+                        la que hubiera. Al cambiar el estado de un pedido se te preguntará si avisar al cliente; al enviar un
+                        presupuesto desde el escritorio se adjunta el PDF.
+                    </Message>
+
+                    <template v-if="!correoServidor">
                     <Message severity="info" :closable="false">
                         Para usar Gmail necesitas una <strong>App Password</strong> de Google. Activa la verificación en 2 pasos en tu cuenta y
                         genera una contraseña de aplicación en
@@ -578,11 +594,14 @@ const selectPdfFolder = async () => {
                         </div>
                     </div>
 
+                    </template>
+
                     <div class="flex items-center gap-3 flex-wrap">
                         <Button label="Guardar" icon="pi pi-save" @click="saveConfig" />
                         <Message v-if="saved" severity="success" :closable="false">Guardado correctamente</Message>
                     </div>
 
+                    <template v-if="!correoServidor">
                     <div class="rounded-2xl card-inset p-4 flex flex-col gap-3 border border-black/[0.05] dark:border-white/[0.06]">
                         <div class="flex items-center gap-2">
                             <i class="pi pi-send text-blue-500" />
@@ -597,6 +616,7 @@ const selectPdfFolder = async () => {
                                 @click="sendTestEmail" :disabled="!config.email_enabled || !config.email_from || !config.email_app_password" />
                         </div>
                     </div>
+                    </template>
                 </div>
             </TabPanel>
 
